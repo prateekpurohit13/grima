@@ -30,3 +30,23 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# GRIMA build output
+/grima
+/dist/
+
+# Host baseline: machine specific, never shared
+grima-baseline.json
+*-baseline.json
+
+# Run output
+*.log
+
+# Smoke test scratch
+/.smoke/
+
+# Sprint scratch: per-agent build output and configs
+/.sprint1/
+
+# Audit scratch
+/.audit/
