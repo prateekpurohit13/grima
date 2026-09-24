@@ -24,6 +24,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 15. [Fusion Was Not Monotonic](#15-fusion-was-not-monotonic)
 16. [Calibration Units Were Mismatched](#16-calibration-units-were-mismatched)
 17. [`ngram_rename_chain` Cannot Tell Extraction From Encryption](#17-ngram_rename_chain-cannot-tell-extraction-from-encryption)
+18. [Two Weight-Table Problems The Ablation Must Price](#18-two-weight-table-problems-the-ablation-must-price)
 
 ---
 
@@ -222,6 +223,10 @@ path real.
 | 4.6 | Weight tuning | W2 | Weights from grid search on a held-out split, not on the reported scenarios |
 | 4.7 | Figures | W3 | Ablation table + TTD distribution + ROC/PR curve |
 | 4.8 | Overhead measurement | W1 | Idle and under-load CPU/RSS, compared against no detector |
+| 4.9 | **Price solo alertability** | W2 | Three Secondary signals sit at 0.5, which is five points above the medium band, so each pages an operator alone. Either weights below 0.45 or a rule that a Secondary needs a Primary companion. Price per signal — §18 |
+| 4.10 | **Price first-seen-extension novelty** | W3 | 30 files of a never-seen extension is a medium alert and it accumulates without a burst. Decide between a minimum-novelty floor and accepting the alert — §18 |
+| 4.11 | **Re-run the signal measurements** | W3 | §17 and §18 rest on scratch programs under `.sprint2/FingerprintWork/`. Re-run them from the ablation harness so the numbers are reproducible from the repo, not from one agent's scratch dir |
+| 4.12 | **Report per-round spread** | W3 | Carried from 2.10. One scenario scored 100 and 56.4 for a purely environmental reason — no single-run figure is trustworthy |
 
 **Safety, non-negotiable for 4.2:** isolated VM, snapshots, host-only network, no shared
 folders, Defender exclusions inside the test VM only. Prefer the simulator for the demo.
@@ -229,6 +234,11 @@ folders, Defender exclusions inside the test VM only. Prefer the simulator for t
 **Exit criterion for the sprint:** a table where every row is a real measurement from a
 reproducible command. If a row does not move the numbers, say so in the paper — a signal
 that earns nothing is worth reporting as such.
+
+**Carried in from Sprint 2.** Items 4.9–4.12 come from measuring the signal set rather than
+from the original plan. Three of them are about signals that are currently alerting on their
+own without corroboration; leaving them to weight-tuning in 4.6 would mean tuning a table
+whose arithmetic is wrong.
 
 ---
 
@@ -1049,3 +1059,75 @@ of an unfamiliar file type alerts, and no weight tuning changes that.
 
 When Sprint 4 prices the extraction workload, `ngram_rename_chain` is neither the only nor the
 largest contributor. Attributing that FP class to it would be wrong.
+
+---
+
+## 18. Two Weight-Table Problems The Ablation Must Price
+
+Both found while characterising signal #14, both wider than that signal.
+
+### A Secondary signal can page an operator on its own
+
+Measured with shipped weights, default bands (low 20, medium 45), one signal saturated and
+nothing else present:
+
+| Signal | Weight | Score alone | Level |
+|---|---|---|---|
+| `entropy_deviation` | 1.0 | 100.0 | critical |
+| `magic_mismatch` | 1.0 | 100.0 | critical |
+| `write_burst` | 1.0 | 100.0 | critical |
+| `write_rate_absolute` | 1.0 | 100.0 | critical |
+| `rename_burst` | 0.8 | 80.0 | high |
+| **`delete_rate`** | **0.5** | **50.0** | **medium** |
+| **`dir_fanout`** | **0.5** | **50.0** | **medium** |
+| **`cum_bytes_rewritten`** | **0.5** | **50.0** | **medium** |
+| `bus_drops` | 0.2 | 20.0 | info |
+| `ngram_rename_chain` | 0.2 | 20.0 | info |
+
+A signal is solo-alertable iff $w \cdot v \ge$ the medium band, so with the default bands **any
+weight ≥ 0.45 alerts alone at full value.** Three Secondary signals therefore sit exactly five
+points above the alert threshold, and one saturated `dir_fanout` or `delete_rate` pages an
+operator with no second opinion — which is the opposite of what "Secondary" is supposed to
+mean.
+
+**This is a coincidence of the $(0.5, 45)$ pair, not a property of the tier.** Move medium to
+55 and all three go silent; move it to 50 and they sit on the edge. That fragility is the real
+finding: the weight table and the level bands were chosen independently and happen to
+interact.
+
+Two candidate fixes, and they are not equivalent:
+
+- **weight < 0.45** for signals meant to corroborate — simple, but leaves the interaction
+  implicit;
+- **a Secondary signal cannot carry a verdict without a Primary companion** — encodes
+  "corroborating" structurally instead of by arithmetic accident.
+
+Price per signal rather than in bulk: `cum_bytes_rewritten` at 1 GiB is plausibly a genuine
+bulk event, while `dir_fanout` at 8× baseline is plausibly just a build.
+
+### `unknown_extension_activity` accumulates to an alert with no burst
+
+Cumulative, benign content, no rename, files of a never-seen extension:
+
+| Files | Score | Level |
+|---|---|---|
+| 10 | 20.0 | info |
+| 20 | 40.0 | low |
+| **30** | **60.0** | **medium — alerts** |
+| 50 | 100.0 | critical |
+| 200 | 100.0 | critical |
+
+**30 files of a first-seen extension is a medium alert, 50 is critical.** Because
+`ExtActivity` never decays — by design, that is what answers Gap 4 — a long-running benign
+process accumulates its way there with no burst at all.
+
+This is a lower bar than expected, and it makes the signal the ablation's flagship candidate:
+it carries weight 1.0 and is the single largest contributor to the extraction false-positive
+class (§17).
+
+**Recalibration only helps the second time.** A recurring workload has its extensions promoted
+and stops alerting. A first-time workload has no baseline to recalibrate from, so the answer
+must be either a minimum-novelty floor — do not alert below N files of an unseen extension —
+or accepting the alert as "unknown file type, watch this". That is a product decision, not a
+tuning one, and it should be made deliberately rather than by leaving the threshold where it
+landed.
