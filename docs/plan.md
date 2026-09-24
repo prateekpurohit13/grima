@@ -166,7 +166,7 @@ it is a mapping, not a novelty claim.
 | Gap | Description (from the literature) | GRIMA mechanism | ML needed? |
 |---|---|---|---|
 | 1 | Lack of cohesive cross-platform implementations; Windows-centric kernel tooling creates security silos | Platform dispatch layer + per-OS sensor adapters behind one `Event` schema; pure Go cross-compilation. **Verified on Windows and Linux in CI**; the macOS adapter ships but is unverified (see `sprints.md` §10) | No |
-| 2 | Multi-process workload splitting blinds per-process classifiers | Tree aggregator sums fingerprints over the ancestor/process group before scoring | No |
+| 2 | Multi-process workload splitting blinds per-process classifiers | Tree aggregator sums fingerprints over the ancestor/process group before scoring. **Requires causal attribution** — with events filed at the host there are no per-process fingerprints to aggregate, and correlative attribution files them against a guessed process. Unelevated, this gap is not addressed (see `sprints.md` §20) | No |
 | 3 | Methodological silos and single-threshold evasion (e.g. entropy alone, which 7-Zip defeats) | 13-signal fusion; rule overrides set a floor; entropy is conditioned on per-extension priors and paired with magic-byte checks | No |
 | 4 | Rigid time-based thresholding fails against wait-timers and drip encryption | Dual-track accumulation: decaying window **plus** non-decaying cumulative counters | No |
 | 5 | Lack of host-calibrated baselines; models trained on generalized corpora transfer poorly to deployment populations | Statistical host baseline learned during warm-up and persisted; all thresholds expressed as deviations from it | No |

@@ -18,7 +18,8 @@
 #   GRIMA_BINARY        detector binary (default: <repo>/grima[.exe])
 #   GRIMA_FP_PORT       dashboard port (default 8794)
 #   GRIMA_FP_WORK       work root (default $TMPDIR/grima-fp)
-#   GRIMA_FP_DURATION   detector run length (default 90s)
+#   GRIMA_FP_DURATION   minimum detector run length (default 90s; raised when
+#                       the workload takes longer, so the detector outlives it)
 #   GRIMA_FP_PYTHON     interpreter for the end-of-run verdict dump
 #
 # Exits 0 when the workload stayed silent, 1 when it produced an alert.
@@ -116,15 +117,29 @@ run_scenario() { # $1 log file, rest: extra scenario args
   "${BASH:-bash}" "$SCRIPT" "$DATA" "$@" > "$log" 2>&1
 }
 
+# GNU tar reads `C:/...` as a remote `host:path` and fails, so a workload that
+# archives by absolute path silently produces no archive under Git-Bash or WSL
+# even though the detector run itself is fine. `--force-local` is the documented
+# GNU answer; bsdtar has no such rule and no such flag, so it is only added when
+# the tar on PATH is GNU. (benign-archive.sh's archiver choice is not
+# drive-letter safe; this keeps the corpus runnable, it does not fix that.)
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+  export TAR_OPTIONS="--force-local ${TAR_OPTIONS:-}"
+fi
+
 # --- calibration: the workload runs while the baseline is captured -----------
 
 "$BINARY" --config "$(to_host_path "$WORK/grima.toml")" --calibrate > "$WORK/calibrate.log" 2>&1 &
 CAL_PID=$!
 
 calibration_passes=0
+slowest_pass=0
 cal_deadline=$(( $(date +%s) + 18 ))
 while [ "$(date +%s)" -lt "$cal_deadline" ]; do
+  pass_start="$(date +%s)"
   run_scenario "$WORK/warmup.log" "$@" || true
+  pass_elapsed=$(( $(date +%s) - pass_start ))
+  [ "$pass_elapsed" -gt "$slowest_pass" ] && slowest_pass="$pass_elapsed"
   calibration_passes=$((calibration_passes + 1))
 done
 wait "$CAL_PID"
@@ -135,6 +150,25 @@ if ! grep -q 'baseline written' "$WORK/calibrate.log"; then
   exit 2
 fi
 echo "baseline captured after $calibration_passes workload pass(es)"
+grep 'baseline written' "$WORK/calibrate.log" | tail -1 | sed 's/^/  /'
+
+# The detector has to outlive the workload. A detector that reaches --duration
+# mid-workload closes its dashboard, so the run ends with no verdicts to read
+# and a workload that was only half watched looks like a silent one. The
+# warm-up passes just timed the workload, so size the measured run from the
+# slowest of them. Only a plain seconds value can be resized; anything else
+# (e.g. "1m30s") is left exactly as the operator set it.
+DURATION_SECS="${DURATION%s}"
+case "$DURATION_SECS" in
+  ''|*[!0-9]*) DURATION_SECS=0 ;;
+esac
+if [ "$DURATION_SECS" -gt 0 ]; then
+  needed=$(( slowest_pass + 30 ))
+  if [ "$needed" -gt "$DURATION_SECS" ]; then
+    echo "detector run extended to ${needed}s: the workload took ${slowest_pass}s in warm-up"
+    DURATION="${needed}s"
+  fi
+fi
 
 # --- measured run -----------------------------------------------------------
 
@@ -151,11 +185,50 @@ fi
 start="$(date +%s)"
 run_scenario "$WORK/workload.log" "$@"
 elapsed=$(( $(date +%s) - start ))
+
+# A workload that aborted writes little or nothing, and "little" also produces
+# no alert — so a silent verdict from a failed workload is not a measurement.
+# Every benign workload ends with a SUMMARY line; without one, say so.
+if ! grep -q '^SUMMARY ' "$WORK/workload.log"; then
+  echo "error: the workload did not complete (no SUMMARY line), so a silent" >&2
+  echo "       verdict would be meaningless:" >&2
+  tail -5 "$WORK/workload.log" >&2
+  kill "$DET_PID" 2>/dev/null
+  wait "$DET_PID" 2>/dev/null
+  trap - EXIT
+  exit 2
+fi
 tail -1 "$WORK/workload.log"
 echo "measured pass: ${elapsed}s"
 
+# The sizing above is an estimate from the warm-up passes; if the measured pass
+# still outran it, the detector is gone and so are its verdicts. Say so rather
+# than reporting a workload nobody was watching.
+if ! kill -0 "$DET_PID" 2>/dev/null; then
+  echo "error: the detector exited before the workload finished (--duration $DURATION)," >&2
+  echo "       so its verdicts were never collected; raise GRIMA_FP_DURATION" >&2
+  tail -3 "$WORK/grima.log" >&2
+  trap - EXIT
+  exit 2
+fi
+
 sleep 8
 curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/verdicts" > "$WORK/verdicts.json" 2>/dev/null
+
+# A silent verdict only means something if the detector saw the workload, so the
+# sensor counters are recorded next to the verdict they justify.
+if curl -fsS --max-time 5 "http://127.0.0.1:$PORT/healthz" > "$WORK/healthz.json" 2>/dev/null; then
+  "$PYTHON" - "$WORK/healthz.json" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))
+fw = (h.get("sensors") or {}).get("filewatch") or {}
+print("observed: calibration_ready=%s filewatch_events=%s filewatch_reporting=%s"
+      % (h.get("calibration_ready"), fw.get("Events"), fw.get("Reporting")))
+PY
+else
+  echo "observed: health endpoint unreachable from this shell"
+fi
+
 kill "$DET_PID" 2>/dev/null
 wait "$DET_PID" 2>/dev/null
 trap - EXIT
@@ -186,6 +259,29 @@ else
   grep 'ransomware risk detected' "$WORK/grima.log" | sed -n '1p;$p'
 fi
 echo "logs: $WORK"
+
+# One machine-readable line, so a spread report or any other consumer reads a
+# parsed result instead of re-parsing the human-readable verdict dump above.
+"$PYTHON" - "$WORK/verdicts.json" "$NAME" "$alerts" <<'PY' || \
+  echo "RESULT scenario=$NAME max_score=unavailable max_level=unavailable max_signals=- alerts=$alerts"
+import json, os, sys
+
+path, name, alerts = sys.argv[1], sys.argv[2], sys.argv[3]
+levels = ["info", "low", "medium", "high", "critical"]
+verdicts = []
+if os.path.exists(path) and os.path.getsize(path):
+    try:
+        verdicts = json.load(open(path))
+    except ValueError:
+        verdicts = []
+if not verdicts:
+    print("RESULT scenario=%s max_score=none max_level=none max_signals=- alerts=%s" % (name, alerts))
+else:
+    peak = max(verdicts, key=lambda v: v["Score"])
+    names = ",".join(s["Name"] for s in (peak.get("Signals") or [])) or "-"
+    print("RESULT scenario=%s max_score=%.1f max_level=%s max_signals=%s alerts=%s"
+          % (name, peak["Score"], levels[peak["Level"]], names, alerts))
+PY
 
 echo
 if [ "$alerts" = "0" ]; then

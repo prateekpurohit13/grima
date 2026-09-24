@@ -38,10 +38,15 @@ func TestSplitWorkloadScoresAsOneActorAboveThreshold(t *testing.T) {
 	now := time.Now()
 
 	const (
-		parent      = int32(4000)
-		workers     = 5
-		rootWrites  = 5
-		childWrites = 80
+		parent     = int32(4000)
+		workers    = 6
+		rootWrites = 5
+		// 180 writes in a ten-second window is 18 writes/s: over the 20/s
+		// absolute threshold, but below the point where the rate signal reaches
+		// its floor, so a child scored alone still produces no evidence. Six of
+		// them summed is 108 writes/s, which saturates that signal and takes the
+		// tree over the medium band.
+		childWrites = 180
 	)
 	threshold := cfg.Scoring.AbsoluteWriteRate * cfg.Window.DecayHalfLife.Std().Seconds()
 	if float64(rootWrites) >= threshold || float64(childWrites) >= threshold {
@@ -102,11 +107,15 @@ func TestSplitWorkloadScoresAsOneActorAboveThreshold(t *testing.T) {
 	if detail == "" {
 		t.Fatalf("the split tree produced no rate signal; signals = %v", verdict.Signals)
 	}
-	if verdict.Score <= 0 {
-		t.Fatalf("the split tree scored %.1f, want above zero", verdict.Score)
+	// "One actor above threshold" is the exit criterion, so the tree has to
+	// cross the band a per-process view would alert on — not merely score above
+	// zero, which a much smaller aggregate also does.
+	if verdict.Level < score.LevelMedium {
+		t.Fatalf("the split tree scored %.1f (%v), want at or above the medium band %.0f",
+			verdict.Score, verdict.Level, cfg.Scoring.LevelBands.Medium)
 	}
-	t.Logf("split tree: %d writes across %d processes, score %.1f, %s",
-		tree.Writes, len(tree.PIDs), verdict.Score, detail)
+	t.Logf("split tree: %d writes across %d processes, score %.1f %v, %s",
+		tree.Writes, len(tree.PIDs), verdict.Score, verdict.Level, detail)
 }
 
 // Characterisation of what the n-gram signal fires on, using the event shapes

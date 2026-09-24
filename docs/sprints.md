@@ -1290,3 +1290,46 @@ This also removes the class of defect rather than instances of it: `write_burst`
 has an arbitrary denominator (§19), cumulative counters no longer fragment (§20), and no
 verdict names a process the detector cannot identify. Verdicts now read `pid=0 process=(host)`,
 which is true.
+
+### The cost: Gap 2 requires elevation
+
+Host mode has a consequence that was not obvious until item 2.6 exercised it, and it is worth
+stating plainly rather than discovering later.
+
+**With every file event filed at the host, there are no per-process fingerprints to aggregate,
+so tree aggregation is never exercised.** Measured: the same split workload that scores a tree
+at 63.2 (medium) under per-process filing produced exactly one verdict under host mode —
+`root=0 process=(host) score=21.0` — and an empty attribution trace.
+
+So the design's answer to **Gap 2 (multi-process workload splitting) does not function in the
+default configuration.** Working it through, this is not a reason to change the default:
+
+| Mode | File events land in | Tree aggregate correct? | Drip detected? |
+|---|---|---|---|
+| `host` | the host fingerprint | no — there is one tree, the host | **yes** |
+| `correlate` | a **guessed** process | **no** — the tree structure is right (PPID is known) but the events are in the wrong branches | no (§20) |
+| `audit` | the **actual** process | **yes** | yes |
+
+`correlate` does not rescue Gap 2 either: the process tree is knowable from PPID, but a tree
+that sums events filed against a guessed process is wrong. So **Gap 2 requires causal
+attribution in every configuration**, and host mode is strictly better than correlate on
+everything else.
+
+**The honest mapping, which the paper must carry:**
+
+| Gap | Unelevated (`host`) | Elevated (`audit`) |
+|---|---|---|
+| 1 — cross-platform | verified on Windows and Linux; macOS unverified | same |
+| 2 — multi-process splitting | **not addressed** | addressed |
+| 3 — single threshold | addressed | addressed |
+| 4 — rigid time windows | addressed | addressed |
+| 5 — host-calibrated baselines | addressed | addressed |
+
+**Four of five gaps unelevated, five of five elevated.** That is a defensible claim and a
+truthful one. The alternative — keeping `correlate` as the default so the architecture diagram
+looks fully exercised — would be shipping a mode measured at 0% accuracy to make a gap appear
+closed, which is exactly the kind of claim this project's own §11 exists to prevent.
+
+Item 2.6's exit criterion is therefore met **under per-process attribution**, which is the
+only configuration in which it can be met, and the sprint plan should say so rather than
+implying it holds by default.
