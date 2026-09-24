@@ -19,6 +19,8 @@ phases are; this says *who does what, in what order, and how we know it is finis
 10. [What Dropping Linux Costs](#10-what-dropping-linux-costs)
 11. [Attribution: The Measured Result](#11-attribution-the-measured-result)
 12. [Why Item 1.5 Is Blocked](#12-why-item-15-is-blocked)
+13. [Detection No Longer Depends On Attribution](#13-detection-no-longer-depends-on-attribution)
+14. [Causal Attribution: What Landed](#14-causal-attribution-what-landed)
 
 ---
 
@@ -125,8 +127,8 @@ the sensors are accurate.
 | 1.1 | Overflow rescan | **Done.** Extracted `handleWatchError` so the branch is reachable; 6 tests. Revert-checked: removing the `rescan` call makes the test fail. |
 | 1.2 | PersistWatch verified | **Done.** 9 tests; 17 baseline entries catalogued on this host; a new Startup-folder entry detected at runtime; pre-existing entries correctly silent. |
 | 1.3 | ProcWatch cost | **Done.** 14–49 ms per sample pass, ≈1.4–4.9% of one core at the 1 s default — the default is justified. 167 processes return empty `Exe()`/`Cmdline()` on this host, with no error, which bounds what attribution can rely on. |
-| 1.4 | **Attribution accuracy** | ❌ **FAILED.** Measured 0% (1,255 decisions over 5 rounds, solo writer). Exit criterion was ≥90%. |
-| 1.5 | Attribution upgrade | ⛔ **BLOCKED.** The named mechanism (ETW kernel provider) requires elevation, which this host does not have, and no non-admin alternative survives testing. Evidence in §12. |
+| 1.4 | **Attribution accuracy** | ❌ **FAILED.** Measured 0% (1,255 decisions over 5 rounds, solo writer). Exit criterion was ≥90%. A causal mechanism now exists behind `attribution.mode = "audit"`, but the number still has to be taken on an elevated host — §14. |
+| 1.5 | Attribution upgrade | 🟡 **IMPLEMENTED, UNMEASURED.** ETW was evaluated and rejected for this delivery; Windows file-system auditing (Security event 4663) is implemented behind a config flag, with correlation as the fallback, and unit-tested unelevated. One elevated run scores the gate: `testdata/scenarios/verify_attribution.ps1`. Evidence and reasoning in §14. |
 | 1.6 | Decoy touch fires | **Done.** `KindDecoyTouch` + `DecoyID` verified in unit tests and end to end at critical. |
 | 1.7 | Sensor health honesty | **Done.** `Reporting` on `sensor.Stats`; 5 tests over the `/healthz` shape a consumer parses. |
 | 1.8 | Linux smoke test | **Cut by decision** (§10). |
@@ -410,7 +412,10 @@ not. The paper should make tree-level claims, not per-process ones.
    which the literature generally does not.
 2. **Adopt causal attribution** in Sprint 2 if per-process claims are wanted: ETW
    (`Microsoft-Windows-Kernel-File`) on Windows, auditd on Linux. Both report the writing
-   PID directly, are OS-provided, and require no custom driver.
+   PID directly, are OS-provided, and require no custom driver. *(Corrected in §14: the
+   Kernel-File write event carries no file path, so ETW needs a second correlation on top of
+   the thread-to-process map. Windows file-system auditing gives the path and the PID in one
+   record, and is what was implemented.)*
 3. **Reframe if not.** If Sprint 2 cannot absorb that work, the honest framing is
    host-level and tree-level detection with an explicit statement that per-process blame is
    not reliable. This is defensible and does not weaken the dual-track or calibration
@@ -492,6 +497,8 @@ designed so that detection does not *depend* on attribution — the file-derived
 
 1. **Run elevated.** Implement ETW consumption behind a build tag or a config flag, and
    measure with an elevated detector. Only then can the ≥90% gate be tested at all.
+   *Status: the flag and the mechanism now exist (§14, `attribution.mode = "audit"`); the
+   elevated measurement has not been taken, so 1.4 stays failed.*
 2. **Re-scope the gate.** If the deployment cannot be elevated, replace 1.4's ≥90% with a
    stated bound: "per-process attribution is unavailable unelevated; tree-level attribution
    is used instead." This is a legitimate re-scope, but it must be an explicit decision
@@ -499,3 +506,208 @@ designed so that detection does not *depend* on attribution — the file-derived
 
 Either way, **the gate stays failed until one of these is chosen.** Do not mark 1.4 complete
 on the strength of having measured the failure.
+
+---
+
+## 13. Detection No Longer Depends On Attribution
+
+§11 claimed detection was unaffected by the attribution failure. That claim was **false on
+Linux**, and the first CI run proved it.
+
+### The bug
+
+`fingerprint.Apply` discarded any file event it could not blame on a process:
+
+```go
+if !ev.Kind.IsFile() || ev.PID == 0 {
+    return
+}
+```
+
+On Windows this never bit, because a background browser always had a non-zero write delta,
+so `Suspect` always returned *some* PID — the wrong one, but a non-zero one, so events
+flowed. On Linux nothing was attributed, every file event was thrown away, and the detector
+went **completely blind**. CI reported:
+
+```
+  filewatch reporting: 0 events
+FAIL: encryption workload was not detected on Linux
+```
+
+The Windows job passed on the same commit. Only a second platform exposed it — which is
+precisely the argument for verifying on more than one.
+
+### Why it mattered beyond Linux
+
+The design says detection must not depend on attribution succeeding. It did. Every signal
+that makes GRIMA work — entropy deviation, magic-byte mismatch, extension novelty — is a
+property of the *file*, not the process, and all of them were being gated behind a
+correlation heuristic that is known to fail 100% of the time.
+
+That is a design-level defect, not a Linux porting bug. It would have surfaced on Windows
+too, the moment attribution returned zero candidates.
+
+### The fix
+
+Unattributed file events are folded into a **host-level fingerprint** (`HostName`, PID 0)
+instead of being dropped, and that fingerprint is scored like any other root. The evidence
+reaches scoring whether or not a process could be named.
+
+Two properties are pinned by tests:
+
+- an unattributed write still produces host-level entropy and magic-mismatch evidence, and
+  the host bucket appears in `Roots()` so it is scored;
+- the host bucket does **not** absorb process trees — a process whose parent is PID 0 (init,
+  or any orphan) is a root in its own right, not a child of the host.
+
+The second matters because `linkChild` already refuses to attach children to PID 0, and that
+behaviour is now load-bearing rather than incidental.
+
+### What it changes for the paper
+
+The claim in §11 is now true rather than aspirational: **detection is independent of
+attribution.** Verdicts carry file-derived evidence at host level when no process can be
+blamed, and at process level when one can. That is a stronger and more honest architecture
+than one whose detection silently depends on a heuristic that fails.
+
+---
+
+## 14. Causal Attribution: What Landed
+
+Item 1.4's gate is still failed: nobody has measured a causal mechanism on an elevated host.
+This section records what was built, why it is auditing rather than ETW, what is verified, and
+the single command that takes the missing measurement.
+
+### The two mechanisms, evaluated
+
+| | ETW `Microsoft-Windows-Kernel-File` | Windows file-system auditing (SACL) |
+|---|---|---|
+| Writer PID | `IssuingThreadId` — a *thread* id, so it needs a thread→process map | `ProcessId`, in the event |
+| File path | **Not in the write event.** Event 16 (Write) carries `FileObject`/`FileKey`; the path needs a second map built from the `Name` events (10/11) | `ObjectName`, in the same event |
+| Process image | not in the event | `ProcessName`, in the same event |
+| Latency | microseconds | tens of milliseconds (event-log delivery) |
+| Privilege needed | `SeSystemProfilePrivilege` | `SeSecurityPrivilege`, plus an audit ACE per directory |
+| Work to build | TDH property parsing, or a third-party consumer, plus two correlation maps | four documented API calls and one XML shape |
+
+Evidence gathered on this host, which is not elevated:
+
+- **Enabling a session is admin-gated**, for kernel and non-kernel providers alike:
+  `logman start grima-probe -p "{EDD08927-9CC4-4E65-B970-C2560FB5C289}" -o probe.etl -ets` →
+  `Access is denied. Try running this command as an administrator.`
+- **The provider's write event has no path.** `wevtutil gp Microsoft-Windows-Kernel-File
+  /ge:true /f:xml` confirms Write = event 16 with `KERNEL_FILE_KEYWORD_WRITE` = 0x200. The
+  templates are not in that dump; the Win10 18990 manifest mirror shows event 16 (both
+  versions) using `ReadArgs`/`ReadArgs_V1`, whose fields are ByteOffset, Irp, FileObject,
+  FileKey, IssuingThreadId, IOSize, IOFlags — no FileName. `NameCreate` (10) carries
+  `FileKey` + `FileName`, so the path can be recovered, but only by a second correlation that
+  has its own miss window.
+- **Reading the Security log is admin-gated too:** `wevtutil qe Security /c:1` →
+  `Access is denied.`, and `auditpol /get /subcategory:"File System"` →
+  `A required privilege is not held by the client. (0x522)`.
+- **Neither Go ETW library is a good fit.** `github.com/bi-zone/etw` is MIT but cgo, which
+  would make a pure-Go repository require a C toolchain for Windows builds;
+  `github.com/0xrawsec/golang-etw` is pure Go but GPL-3.0, which cannot be linked into this
+  MIT repository. A hand-written TDH consumer cannot be exercised at all unelevated, and a
+  wrong `EVENT_TRACE_LOGFILEW` layout fails by crashing an elevated process, not by erroring.
+
+**Recommendation: auditing.** One 4663 record carries the path, the PID and the image name.
+The ETW alternative needs two independent correlation maps — one of them thread→process, with
+the same "the evidence is gone by observation time" failure mode that sank the volume
+heuristic — and its latency advantage buys nothing when the detector's windows are seconds
+wide. The audit path is also the one that can be largely verified without elevation.
+
+### What was implemented
+
+`attribution.mode` selects the mechanism. The default is `correlate`, which is exactly the
+behaviour measured in §11, so nothing regresses.
+
+| Mode | Mechanism |
+|---|---|
+| `correlate` | the write-volume heuristic, unchanged |
+| `audit` | Windows file-system auditing: `SeSecurityPrivilege`, a success-audit ACE for `Everyone` covering write and delete rights on each monitored directory (inherited), the File System audit subcategory enabled for successes, and a push subscription (`EvtSubscribe`) to Security event 4663 |
+| `etw` | **rejected at startup** with the reason, rather than shipped unverified |
+
+How a file event gets its writer:
+
+1. The 4663 record's `ObjectName` is an NT device path (`\Device\HarddiskVolume4\...`); it is
+   translated to the DOS path the file sensor reports, using `QueryDosDevice` for each drive.
+2. Records go into a bounded, time-windowed index keyed by path. Records older than the
+   window, records without a path or PID, and the detector's own writes are dropped and
+   counted.
+3. The file sensor hands each event to a resolver goroutine instead of attributing inline.
+   The resolver waits up to `attribution.max_delay` (default 300 ms) for a matching record and
+   emits the event either way, so the sensor's goroutine never blocks.
+4. A run of `causalMissStreak` (20) events with no record marks the mechanism degraded: the
+   resolver stops waiting, logs it, and still looks. One arriving record clears it and logs
+   the recovery. A source that dies mid-run cannot quietly slow the detector down.
+5. If the mechanism cannot start — not elevated, no `SeSecurityPrivilege`, no subscription —
+   the reason is logged at warn and the detector continues in correlation mode. It never fails
+   to start and never looks healthy while blind.
+
+Health counters (`attrib_causal_hits`, `attrib_correlate`, `attrib_pending_drop`,
+`attrib_source_error`) are on the file sensor's `/healthz` entry, and the trace gained a
+`source` field (`causal` or `correlate`) per decision.
+
+### Verified without elevation
+
+- **The fallback.** Running the detector with `mode = "audit"` on this host logs
+  `causal attribution unavailable, correlating instead ... reason="file-system auditing needs
+  an elevated process, and this one is not elevated"`, keeps detecting (critical verdict on the
+  writer's files), and traces every decision with `source":"correlate"`. Scored 0% — the same
+  measured failure as §11, which is the point: the fallback is the old behaviour.
+- **4663 parsing** against the provider's own field names, including reads, non-file objects,
+  other event ids, unmapped volumes, missing process ids, malformed XML and unreadable
+  timestamps.
+- **Device-path translation** against this host: the system drive's `QueryDosDevice` name
+  round-trips back to `C:\`.
+- **The audit ACE** is built and inspected without installing it: one `SYSTEM_AUDIT_ACE_TYPE`
+  entry, the write mask, inheritance flags, correct SID.
+- **Privilege detection** is read back from the token, so an unelevated process gets
+  `enable SeSecurityPrivilege: the process does not hold the privilege` rather than a silent
+  success — `AdjustTokenPrivileges` reports success even when it changes nothing.
+- **Thread→PID, index bounds, degradation, queue overflow and shutdown drops** with synthetic
+  records.
+
+Two bugs were caught this way and fixed before any elevated run: `AddAuditAccessAceEx` takes
+the access mask *before* the SID (the swapped call produced `ERROR_INVALID_SID`, which would
+have made the SACL silently absent), and `EvtSubscribeActionDeliver` is **1**, not 0 — with
+the wrong constant the callback would have discarded every delivered event.
+
+### Not verified, and why
+
+- **The subscription and the render path** (`EvtSubscribe` → callback → `EvtRender` → parse).
+  Both need an elevated process to open the Security channel; nothing about them can be
+  exercised here. They are written against the documented signatures, and the dispatch
+  constants are pinned by a test, but they have never run.
+- **The audit policy and the ACE against a live directory**, and therefore whether the
+  Security log actually delivers 4663 records for the monitored tree.
+- **The ≥90% number itself.** It needs an elevated run.
+
+### The measurement
+
+From an elevated PowerShell, at the repository root:
+
+```powershell
+.\testdata\scenarios\verify_attribution.ps1
+```
+
+It builds the detector, runs 5 rounds of the known-writer scenario against a temporary
+directory with `mode = "audit"`, scores each trace with `score_attribution.py`, and prints the
+aggregate plus a pass/fail against the 90% gate. It leaves the traces, logs and configs in
+`%TEMP%\grima-attrib-verify` for inspection, and it leaves the audit ACE and audit policy in
+place. Use `-Rounds 1 -Files 20` for a quick check, and `-AllowUnelevated` to rehearse the
+harness (which will report 0% and say why).
+
+Two things to know before running it. The ACE covers write and delete rights only, so the
+Security log sees one record per write under the monitored directories and nothing for reads;
+on a large monitored tree, raise the log size first (`wevtutil sl Security /ms:268435456`). And
+the policy can be confirmed by hand with `auditpol /get /subcategory:"File System"`, which
+should report Success once the detector has started in audit mode.
+
+What to expect if the mechanism works: `accuracy ≥ 90%`, with `causal` on nearly every
+decision and only a handful attributed by correlation (the ones whose audited record did not
+arrive inside `max_delay`). If the script reports that the mechanism never started, read the
+reason it prints — it is the same line the detector logged.
+
+**Until that number exists, 1.4 stays failed.** A mechanism that is implemented, unit-tested
+and unelevated-verified is not a measurement.

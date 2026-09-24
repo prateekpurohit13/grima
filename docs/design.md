@@ -331,8 +331,9 @@ func (e *Engine) Live() int
   scoring consumes.
 - `Reap(pid)` releases state on `KindProcessExit`, re-parenting orphans to root rather
   than dropping them from the tree.
-- Events with `PID == 0` are ignored: an unattributed event cannot belong to any
-  per-process fingerprint.
+- Events with `PID == 0` are **not discarded**: they go into a host-level fingerprint
+  (`HostName`, PID 0) so their file-derived evidence still reaches scoring. Detection must
+  not depend on attribution succeeding — see `sprints.md` §13.
 
 ### Not implemented: event n-grams
 

@@ -129,13 +129,24 @@ pass "benign rewrite did not alert"
 
 # --- malicious workload: must alert -----------------------------------------
 
+dump_diagnostics() {
+  echo "--- healthz after the workload ---"
+  curl -fsS "http://127.0.0.1:$PORT/healthz" 2>/dev/null | "$PYTHON" -m json.tool 2>/dev/null || echo "(unavailable)"
+  echo "--- verdicts ---"
+  curl -fsS "http://127.0.0.1:$PORT/api/verdicts" 2>/dev/null | head -c 2000 || echo "(unavailable)"
+  echo
+  echo "--- grima log ---"
+  cat "$LOG"
+  echo "--- encryptor log ---"
+  cat "$WORK/encryptor.log"
+}
+
 "$PYTHON" "$ROOT/testdata/scenarios/encryptor.py" --path "$DATA" --rate burst --seed 7 \
   > "$WORK/encryptor.log" 2>&1 || fail "encryptor fixture failed"
 sleep 6
 
 if ! grep -qE 'level=(high|critical)' "$LOG"; then
-  echo "--- grima log ---"; cat "$LOG"
-  echo "--- encryptor log ---"; cat "$WORK/encryptor.log"
+  dump_diagnostics
   fail "encryption workload was not detected on Linux"
 fi
 pass "encryption workload detected"

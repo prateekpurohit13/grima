@@ -36,12 +36,19 @@ func (e *Engine) Apply(ev event.Event) {
 		return
 	}
 
-	// Unattributed events cannot belong to any per-process fingerprint.
-	if !ev.Kind.IsFile() || ev.PID == 0 {
+	// Unattributed file events still carry evidence — entropy, magic bytes,
+	// extension novelty — that is a property of the file, not the process. They
+	// go into a host-level fingerprint rather than being discarded, so detection
+	// does not depend on attribution succeeding.
+	if !ev.Kind.IsFile() {
 		return
 	}
 
-	p := e.ensure(ev.PID, ev.ProcName, ev.PPID, ev.Time)
+	name := ev.ProcName
+	if ev.PID == 0 && name == "" {
+		name = HostName
+	}
+	p := e.ensure(ev.PID, name, ev.PPID, ev.Time)
 	p.push(sample{
 		at:      ev.Time,
 		kind:    ev.Kind,

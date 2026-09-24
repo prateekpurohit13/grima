@@ -151,7 +151,11 @@ func runScoreLoop(ctx context.Context, loop scoreLoop) {
 func (l scoreLoop) evaluate() {
 	dropped := l.events.Stats().Dropped
 
+	hostScored := false
 	for _, root := range l.engine.Roots() {
+		if root == 0 {
+			hostScored = true
+		}
 		verdict := l.scorer.Evaluate(score.Inputs{
 			Tree:       l.engine.Aggregate(root),
 			Baseline:   l.baseline,
@@ -164,11 +168,15 @@ func (l scoreLoop) evaluate() {
 		l.publish(verdict)
 	}
 
-	// Unattributed rule hits (a persistence install, for example) belong to the
-	// host rather than to any one process.
+	// A rule hit with no process behind it (a persistence install, say) belongs
+	// to the host. Score it only if the host fingerprint did not already cover
+	// it, so the same evidence is not reported twice.
+	if hostScored {
+		return
+	}
 	if hostOverrides := l.overrides.For(0); len(hostOverrides) > 0 {
 		l.publish(l.scorer.Evaluate(score.Inputs{
-			Tree:       fingerprint.TreeVector{Root: 0, ProcName: "(host)"},
+			Tree:       fingerprint.TreeVector{Root: 0, ProcName: fingerprint.HostName},
 			Baseline:   l.baseline,
 			BusDropped: dropped,
 			Overrides:  hostOverrides,

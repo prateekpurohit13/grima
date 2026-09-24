@@ -12,6 +12,10 @@ import (
 // (live processes x ringCapacity) regardless of uptime.
 const ringCapacity = 4096
 
+// HostName labels the fingerprint that collects file events no process could be
+// blamed for, so their evidence still reaches scoring.
+const HostName = "(host)"
+
 type sample struct {
 	at      time.Time
 	kind    event.Kind

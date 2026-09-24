@@ -84,14 +84,60 @@ func TestExtensionActivityIsCumulative(t *testing.T) {
 	}
 }
 
-// Sad path: an event with no attributable process must not create state.
-func TestUnattributedEventsAreIgnored(t *testing.T) {
+// Unattributed file events must still reach scoring: entropy, magic bytes, and
+// extension novelty are properties of the file, not the process. Discarding
+// them made detection depend on attribution succeeding — which is exactly what
+// the design claims it does not, and it made the detector blind on Linux where
+// nothing gets attributed.
+func TestUnattributedFileEventsFormAHostFingerprint(t *testing.T) {
 	e := testEngine(t, time.Minute)
 
-	e.Apply(event.Event{Kind: event.KindFileWrite, PID: 0, Path: "/data/a.txt"})
+	e.Apply(event.Event{
+		Kind:          event.KindFileWrite,
+		PID:           0,
+		Path:          "/data/report.docx",
+		Bytes:         4096,
+		Entropy:       7.9,
+		MagicMismatch: true,
+		Time:          time.Now(),
+	})
 
-	if e.Live() != 0 {
-		t.Fatalf("live processes = %d, want 0", e.Live())
+	tv := e.Aggregate(0)
+	if tv.Writes != 1 {
+		t.Fatalf("host writes = %d, want 1", tv.Writes)
+	}
+	if tv.ProcName != HostName {
+		t.Fatalf("host name = %q, want %q", tv.ProcName, HostName)
+	}
+	if tv.MagicMismatch != 1 || len(tv.Entropy) != 1 {
+		t.Fatalf("host evidence lost: mismatches=%d, entropy samples=%d",
+			tv.MagicMismatch, len(tv.Entropy))
+	}
+
+	roots := e.Roots()
+	if len(roots) != 1 || roots[0] != 0 {
+		t.Fatalf("roots = %v, want [0] so the host fingerprint is scored", roots)
+	}
+}
+
+// The host fingerprint must not absorb process trees: a process whose parent is
+// PID 0 is a root in its own right, not a child of the host bucket.
+func TestHostFingerprintDoesNotAbsorbProcessTrees(t *testing.T) {
+	e := testEngine(t, time.Minute)
+	now := time.Now()
+
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 1, PPID: 0, ProcName: "init", Time: now})
+	e.Apply(write(1, "/data/a.txt", 10, now))
+	e.Apply(event.Event{Kind: event.KindFileWrite, PID: 0, Path: "/data/b.txt", Time: now})
+
+	host := e.Aggregate(0)
+	if len(host.PIDs) != 1 || host.PIDs[0] != 0 {
+		t.Fatalf("host tree = %v, want just the host bucket", host.PIDs)
+	}
+
+	initTree := e.Aggregate(1)
+	if initTree.Writes != 1 {
+		t.Fatalf("init writes = %d, want 1 (its own, not the host's)", initTree.Writes)
 	}
 }
 
