@@ -1,0 +1,94 @@
+name: cross-platform
+
+# Verifies GRIMA on a real Linux host and a real Windows host. This is the
+# evidence for the cross-platform claim: a green run here is reproducible by
+# anyone, which a local run is not.
+#
+# The Linux job is the only place the Linux sensors are exercised. See
+# docs/sprints.md §10 for why that matters.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: format check
+        run: make fmt-check
+
+      - name: vet
+        run: make vet
+
+      - name: test
+        run: make race
+
+      - name: build
+        run: make build
+
+      - name: confirm static linking
+        run: |
+          file ./grima
+          if file ./grima | grep -qi 'dynamically linked'; then
+            echo "::error::binary is dynamically linked; CGO_ENABLED=0 was not honoured"
+            exit 1
+          fi
+
+      - name: smoke test
+        run: bash testdata/scenarios/smoke-linux.sh
+
+      - name: upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-smoke-logs
+          path: /tmp/grima-smoke-*
+          if-no-files-found: ignore
+
+  windows:
+    name: windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: vet
+        run: make vet
+
+      - name: test
+        run: make race
+
+      - name: build
+        run: make build
+
+      - name: smoke test
+        run: bash testdata/scenarios/smoke.sh
+
+      - name: upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-logs
+          path: .smoke/
+          if-no-files-found: ignore
