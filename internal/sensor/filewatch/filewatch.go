@@ -1,0 +1,351 @@
+// Package filewatch watches directories for file changes and samples changed
+// files for entropy and content-vs-extension mismatches.
+package filewatch
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+
+	"github.com/prateekpurohit13/grima/internal/attrib"
+	"github.com/prateekpurohit13/grima/internal/config"
+	"github.com/prateekpurohit13/grima/internal/decoy"
+	"github.com/prateekpurohit13/grima/internal/event"
+	"github.com/prateekpurohit13/grima/internal/sensor"
+)
+
+const name = "filewatch"
+
+// Source watches the configured directories.
+type Source struct {
+	cfg    config.Config
+	log    *slog.Logger
+	attrib *attrib.Attributor
+	decoys *decoy.Registry
+
+	watcher *fsnotify.Watcher
+	done    chan struct{}
+	closeMu sync.Once
+	wg      sync.WaitGroup
+
+	events   atomic.Uint64
+	errors   atomic.Uint64
+	dropped  atomic.Uint64
+	overflow atomic.Uint64
+	rescans  atomic.Uint64
+}
+
+// New returns a file sensor.
+func New(cfg config.Config, at *attrib.Attributor, decoys *decoy.Registry, log *slog.Logger) *Source {
+	return &Source{
+		cfg:    cfg,
+		log:    log,
+		attrib: at,
+		decoys: decoys,
+		done:   make(chan struct{}),
+	}
+}
+
+func (s *Source) Name() string { return name }
+
+// Start watches every monitored directory. It fails rather than starting blind
+// if no directory can be watched at all.
+func (s *Source) Start(ctx context.Context, out chan<- event.Event) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("%s: create watcher: %w", name, err)
+	}
+	s.watcher = watcher
+
+	watched := 0
+	for _, root := range s.cfg.General.MonitorPaths {
+		n, err := addTree(watcher, root)
+		if err != nil {
+			s.log.Warn("partial watch", "path", root, "error", err)
+		}
+		watched += n
+	}
+	if watched == 0 {
+		watcher.Close()
+		return fmt.Errorf("%s: no directory under %v could be watched", name, s.cfg.General.MonitorPaths)
+	}
+
+	s.log.Info("watching directories", "source", name, "count", watched)
+
+	s.wg.Add(1)
+	go s.loop(ctx, out)
+	return nil
+}
+
+// Close stops watching. Idempotent.
+func (s *Source) Close() error {
+	s.closeMu.Do(func() {
+		close(s.done)
+		if s.watcher != nil {
+			s.watcher.Close()
+		}
+		s.wg.Wait()
+	})
+	return nil
+}
+
+// Stats reports sensor health.
+func (s *Source) Stats() sensor.Stats {
+	return sensor.Stats{
+		Name:    name,
+		Events:  s.events.Load(),
+		Errors:  s.errors.Load(),
+		Dropped: s.dropped.Load(),
+		Extra: map[string]uint64{
+			"overflow": s.overflow.Load(),
+			"rescans":  s.rescans.Load(),
+		},
+	}
+}
+
+func (s *Source) loop(ctx context.Context, out chan<- event.Event) {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.done:
+			return
+		case fsEv, ok := <-s.watcher.Events:
+			if !ok {
+				return
+			}
+			s.handle(fsEv, out)
+		case err, ok := <-s.watcher.Errors:
+			if !ok {
+				return
+			}
+			s.handleWatchError(err, out)
+		}
+	}
+}
+
+// handleWatchError counts a watch error and rescans after an overflow, because
+// notifications lost to the overflow would otherwise never be seen.
+func (s *Source) handleWatchError(err error, out chan<- event.Event) {
+	s.errors.Add(1)
+	s.log.Warn("watch error", "source", name, "error", err)
+
+	if isOverflow(err) && s.cfg.FileWatch.RescanOnOverflow {
+		s.overflow.Add(1)
+		s.rescan(out)
+	}
+}
+
+func (s *Source) handle(fsEv fsnotify.Event, out chan<- event.Event) {
+	path := fsEv.Name
+
+	// A new directory needs its own watch, or everything created inside it is
+	// invisible from here on.
+	if fsEv.Op&fsnotify.Create != 0 {
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			if _, err := addTree(s.watcher, path); err == nil {
+				return
+			}
+		}
+	}
+
+	kind, ok := kindFor(fsEv.Op)
+	if !ok {
+		return
+	}
+
+	ev := event.Event{Kind: kind, Path: path}
+	if kind == event.KindFileWrite || kind == event.KindFileCreate {
+		s.readContent(&ev, path)
+	}
+	s.attribute(&ev)
+
+	if id, isDecoy := s.decoys.Lookup(path); isDecoy {
+		ev.Kind = event.KindDecoyTouch
+		ev.DecoyID = id
+	}
+
+	s.emit(out, ev)
+}
+
+// rescan re-reads recently modified files after an event overflow, so a storm
+// that outran the notification buffer still reaches the fingerprint window.
+func (s *Source) rescan(out chan<- event.Event) {
+	const window = 5 * time.Second
+
+	s.rescans.Add(1)
+	seen := make(map[string]struct{})
+	cutoff := time.Now().Add(-window)
+
+	for _, root := range s.cfg.General.MonitorPaths {
+		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil || info.ModTime().Before(cutoff) {
+				return nil
+			}
+			if _, dup := seen[path]; dup {
+				return nil
+			}
+			seen[path] = struct{}{}
+
+			ev := event.Event{Kind: event.KindFileWrite, Path: path}
+			s.readContent(&ev, path)
+			s.attribute(&ev)
+			s.emit(out, ev)
+			return nil
+		})
+	}
+}
+
+func (s *Source) readContent(ev *event.Event, path string) {
+	head, tail, total, err := readSample(path, s.cfg.FileWatch.EntropySampleBytes)
+	if err != nil {
+		return // unreadable: entropy stays zero, which means unknown
+	}
+	ev.Bytes = total
+	if len(head)+len(tail) > 0 {
+		ev.Entropy = shannon(head, tail)
+	}
+	ev.MagicMismatch = looksWrong(path, head)
+}
+
+func (s *Source) attribute(ev *event.Event) {
+	pid, procName, ppid, exe, confidence := s.attrib.Suspect(time.Now())
+	ev.PID = pid
+	ev.ProcName = procName
+	ev.PPID = ppid
+	ev.Exe = exe
+	ev.AttribConfidence = confidence
+}
+
+func (s *Source) emit(out chan<- event.Event, ev event.Event) {
+	ev.Source = name
+	ev.Time = time.Now()
+	s.events.Add(1)
+
+	select {
+	case out <- ev:
+	default:
+		s.dropped.Add(1)
+	}
+}
+
+func kindFor(op fsnotify.Op) (event.Kind, bool) {
+	switch {
+	case op&fsnotify.Create != 0:
+		return event.KindFileCreate, true
+	case op&fsnotify.Write != 0:
+		return event.KindFileWrite, true
+	case op&fsnotify.Remove != 0:
+		return event.KindFileDelete, true
+	case op&fsnotify.Rename != 0:
+		return event.KindFileRename, true
+	}
+	return event.KindUnknown, false
+}
+
+func isOverflow(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "overflow")
+}
+
+// addTree watches root and every subdirectory under it, skipping subtrees it
+// cannot read rather than failing the whole watch.
+func addTree(watcher *fsnotify.Watcher, root string) (int, error) {
+	added := 0
+	var firstErr error
+
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if err := watcher.Add(path); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		added++
+		return nil
+	})
+
+	return added, firstErr
+}
+
+// readSample reads the head and tail of a file. Sampling rather than reading the
+// whole file bounds I/O under an encryption storm and still catches partial
+// encryption that leaves the middle untouched.
+func readSample(path string, size int) (head, tail []byte, total int64, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	total = info.Size()
+
+	head = make([]byte, size)
+	n, err := io.ReadFull(f, head)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, nil, total, err
+	}
+	head = head[:n]
+
+	if total > int64(size)*2 {
+		tail = make([]byte, size)
+		if _, err := f.ReadAt(tail, total-int64(size)); err != nil {
+			tail = nil
+		}
+	}
+	return head, tail, total, nil
+}
+
+// shannon returns the Shannon entropy in bits per byte across the sampled parts.
+func shannon(parts ...[]byte) float64 {
+	var counts [256]int
+	total := 0
+	for _, p := range parts {
+		for _, b := range p {
+			counts[b]++
+			total++
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+
+	var h float64
+	for _, c := range counts {
+		if c == 0 {
+			continue
+		}
+		p := float64(c) / float64(total)
+		h -= p * math.Log2(p)
+	}
+	return h
+}

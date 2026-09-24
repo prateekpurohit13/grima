@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GRIMA</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
+         background: #14161a; color: #d8dee9; margin: 0; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #7b8794; margin-bottom: 20px; }
+  .banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 16px;
+            background: #4a3a10; color: #ffd479; border: 1px solid #7a5c12; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #262a31;
+           vertical-align: top; }
+  th { color: #7b8794; font-weight: normal; }
+  .lvl { padding: 1px 7px; border-radius: 3px; font-size: 12px; }
+  .info { background: #262a31; } .low { background: #1f3a2a; color: #7ee2a8; }
+  .medium { background: #4a3a10; color: #ffd479; }
+  .high { background: #4a2410; color: #ff9f6e; }
+  .critical { background: #4d1a1a; color: #ff7b7b; }
+  .sig { color: #9aa5b1; font-size: 12px; }
+  .empty { color: #7b8794; padding: 20px 0; }
+  footer { margin-top: 24px; color: #7b8794; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>GRIMA</h1>
+  <div class="sub">Adaptive multi-layer ransomware detection &mdash; live process risk</div>
+
+  <div id="banner" class="banner" hidden>
+    Uncalibrated mode: no host baseline yet, so deviation signals are inactive.
+    Override rules and absolute thresholds still apply.
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>PID</th><th>Process</th><th>Level</th><th>Score</th><th>Evidence</th></tr>
+    </thead>
+    <tbody id="rows">
+      <tr><td colspan="5" class="empty">Waiting for verdicts&hellip;</td></tr>
+    </tbody>
+  </table>
+
+  <footer id="footer">connecting&hellip;</footer>
+
+<script>
+const rows = document.getElementById("rows");
+const banner = document.getElementById("banner");
+const footer = document.getElementById("footer");
+const seen = new Map();
+
+function levelClass(level) {
+  return ["info","low","medium","high","critical"][level] || "info";
+}
+
+function render() {
+  const list = [...seen.values()].sort((a, b) => b.Score - a.Score);
+  if (list.length === 0) return;
+  rows.innerHTML = list.map(v => {
+    const evidence = (v.Signals || [])
+      .map(s => `${s.Name}: ${s.Detail}`)
+      .join("<br>");
+    return `<tr>
+      <td>${v.PID}</td>
+      <td>${v.ProcName || "(unattributed)"}</td>
+      <td><span class="lvl ${levelClass(v.Level)}">${levelClass(v.Level)}</span></td>
+      <td>${v.Score.toFixed(1)}</td>
+      <td class="sig">${evidence || "&mdash;"}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function refreshHealth() {
+  try {
+    const h = await (await fetch("/healthz")).json();
+    banner.hidden = h.calibration_ready;
+    footer.textContent =
+      `published ${h.bus_published} · dropped ${h.bus_dropped} · ` +
+      `processes ${h.live_processes} · uptime ${Math.round(h.uptime_seconds)}s`;
+  } catch (e) {
+    footer.textContent = "health unavailable";
+  }
+}
+
+fetch("/api/verdicts").then(r => r.json()).then(list => {
+  (list || []).forEach(v => seen.set(v.PID, v));
+  render();
+});
+
+const events = new EventSource("/events");
+events.onmessage = e => {
+  const v = JSON.parse(e.data);
+  seen.set(v.PID, v);
+  render();
+};
+
+refreshHealth();
+setInterval(refreshHealth, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,183 @@
+// Package app wires the sensors, bus, fingerprint engine, scorer, rules, and
+// dashboard together and runs the detection loop.
+package app
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/prateekpurohit13/grima/internal/bus"
+	"github.com/prateekpurohit13/grima/internal/calibrate"
+	"github.com/prateekpurohit13/grima/internal/config"
+	"github.com/prateekpurohit13/grima/internal/decoy"
+	"github.com/prateekpurohit13/grima/internal/event"
+	"github.com/prateekpurohit13/grima/internal/fingerprint"
+	"github.com/prateekpurohit13/grima/internal/platform"
+	"github.com/prateekpurohit13/grima/internal/response"
+	"github.com/prateekpurohit13/grima/internal/rules"
+	"github.com/prateekpurohit13/grima/internal/score"
+	"github.com/prateekpurohit13/grima/internal/sensor"
+	"github.com/prateekpurohit13/grima/internal/web"
+)
+
+// Options are the runtime knobs that come from the command line.
+type Options struct {
+	Duration  time.Duration
+	Calibrate bool
+}
+
+const sensorBuffer = 4096
+
+// Run starts the detector and blocks until ctx is cancelled.
+func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger) error {
+	if opts.Duration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.Duration)
+		defer cancel()
+	}
+
+	policy, _ := bus.ParseDropPolicy(cfg.Bus.DropPolicy)
+	events := bus.New(cfg.Bus.Capacity, policy)
+	defer events.Close()
+
+	host := platform.Detect(cfg, log)
+	log.Info("platform detected", "os", host.OS)
+
+	defer func() {
+		if err := host.Attrib.Close(); err != nil {
+			log.Warn("closing attribution trace", "error", err)
+		}
+	}()
+
+	if cfg.Decoy.Enabled {
+		planted, err := decoy.Plant(cfg, host.Decoys)
+		if err != nil {
+			log.Warn("decoy planting partially failed", "error", err)
+		}
+		log.Info("decoys planted", "count", planted)
+	}
+
+	sources, err := startSensors(ctx, cfg, host, events, log)
+	if err != nil {
+		return err
+	}
+	defer closeSensors(sources)
+
+	if opts.Calibrate {
+		return runCalibration(ctx, cfg, events, log)
+	}
+
+	baseline, err := calibrate.Load(cfg.Calibration.BaselinePath)
+	if err != nil {
+		log.Warn("baseline unreadable, running uncalibrated", "error", err)
+	}
+	if baseline == nil || !baseline.Ready() {
+		log.Warn("no usable baseline: deviation signals are inactive until one is captured",
+			"path", cfg.Calibration.BaselinePath)
+	}
+
+	engine := fingerprint.NewEngine(cfg)
+	scorer := score.NewScorer(cfg)
+	ruleEngine := rules.NewEngine(cfg)
+	responder := response.NewHandler(cfg, log)
+	overrides := newOverrideTracker(cfg.Window.DecayHalfLife.Std())
+
+	startedAt := time.Now()
+	hub := web.NewHub(func() web.Health {
+		return healthSnapshot(startedAt, events, sources, engine, baseline)
+	})
+
+	startFingerprintLoop(ctx, engine, events.Subscribe("fingerprint", cfg.Bus.Capacity/2))
+	startRuleLoop(ctx, ruleEngine, overrides, events.Subscribe("rules", cfg.Bus.Capacity))
+
+	if cfg.Web.Enabled {
+		server, err := web.NewServer(cfg, hub, log)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := server.Start(ctx); err != nil {
+				log.Warn("dashboard stopped", "error", err)
+			}
+		}()
+	}
+
+	runScoreLoop(ctx, scoreLoop{
+		cfg:       cfg,
+		events:    events,
+		engine:    engine,
+		scorer:    scorer,
+		overrides: overrides,
+		responder: responder,
+		hub:       hub,
+		baseline:  baseline,
+		log:       log,
+	})
+
+	log.Info("grima stopped",
+		"published", events.Stats().Published,
+		"dropped", events.Stats().Dropped,
+	)
+	return nil
+}
+
+func startSensors(ctx context.Context, cfg config.Config, host platform.Set, events *bus.Bus, log *slog.Logger) ([]sensor.Source, error) {
+	var started []sensor.Source
+
+	for _, src := range host.Sources {
+		out := make(chan event.Event, sensorBuffer)
+		if err := src.Start(ctx, out); err != nil {
+			log.Warn("sensor unavailable", "source", src.Name(), "error", err)
+			continue
+		}
+		started = append(started, src)
+		go pumpToBus(ctx, out, events)
+	}
+
+	// Running with no sensors would look healthy while being blind.
+	if len(started) == 0 {
+		return nil, fmt.Errorf("no sensor could start on %s", host.OS)
+	}
+	return started, nil
+}
+
+func closeSensors(sources []sensor.Source) {
+	for _, src := range sources {
+		_ = src.Close()
+	}
+}
+
+func pumpToBus(ctx context.Context, out <-chan event.Event, events *bus.Bus) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-out:
+			if !ok {
+				return
+			}
+			events.Publish(ev)
+		}
+	}
+}
+
+func runCalibration(ctx context.Context, cfg config.Config, events *bus.Bus, log *slog.Logger) error {
+	log.Info("capturing host baseline", "warmup", cfg.Calibration.Warmup.Std().String())
+
+	baseline, err := calibrate.Capture(ctx, cfg, events)
+	if err != nil {
+		return fmt.Errorf("capture baseline: %w", err)
+	}
+	if err := baseline.Save(cfg.Calibration.BaselinePath); err != nil {
+		return fmt.Errorf("save baseline: %w", err)
+	}
+
+	log.Info("baseline written",
+		"path", cfg.Calibration.BaselinePath,
+		"extensions", len(baseline.EntropyByExt),
+		"processes", len(baseline.WriteRateByProc),
+	)
+	return nil
+}
