@@ -713,3 +713,43 @@ reason it prints — it is the same line the detector logged.
 
 **Until that number exists, 1.4 stays failed.** A mechanism that is implemented, unit-tested
 and unelevated-verified is not a measurement.
+
+### First elevated run: the mechanism did not start
+
+Run on 2026-09-24 on an elevated host. All five rounds reported:
+
+```
+causal attribution unavailable, correlating instead
+mode=audit reason="enable file-system auditing: AuditQuerySystemPolicy: Incorrect function."
+decisions 975, correct 0, causal 0 (0.0% of decisions)
+```
+
+**The failure was in the code, not the environment.** `AuditQuerySystemPolicy` is declared as
+returning a `BOOLEAN` — zero for failure, non-zero for success — but the call site read the
+return value as an error code:
+
+```go
+ret, _, _ := procAuditQueryPolicy.Call(...)
+if status := uint32(ret); status != 0 {
+    return 0, fmt.Errorf("AuditQuerySystemPolicy: %w", syscall.Errno(status))
+}
+```
+
+So a **successful** call returning `TRUE` (1) was reported as `errno 1`, `ERROR_INVALID_FUNCTION`
+— "Incorrect function". The auditing API worked and the code called it a failure. The sibling
+`setSystemAuditPolicy` gets this right (`if ok == 0`), so the two were inconsistent.
+
+Two fixes: the return value is now treated as a boolean, with the real error taken from
+`GetLastError`; and the structure the system allocates is released with `AuditFree` rather than
+`LocalFree`, which is what the API documents.
+
+A test now resolves all three function pointers by name, because a mistyped symbol does not fail
+a build — it panics on an elevated host, in the one run that is expensive to repeat.
+
+**What this run did prove.** The graceful-degradation path works: the detector logged a precise
+reason, fell back to correlation, and kept running rather than failing to start. The harness
+also correctly refused to report a number it had not measured, printing "the audit mechanism
+never started, so this run does not measure it" instead of a misleading 0%.
+
+**The measurement is still outstanding.** Re-run the same command; the fix is in the detector,
+so no change to the procedure is needed.

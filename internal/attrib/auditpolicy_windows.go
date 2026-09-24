@@ -4,7 +4,6 @@ package attrib
 
 import (
 	"fmt"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -29,7 +28,7 @@ var (
 	modadvapi32              = windows.NewLazySystemDLL("advapi32.dll")
 	procAuditQueryPolicy     = modadvapi32.NewProc("AuditQuerySystemPolicy")
 	procAuditSetSystemPolicy = modadvapi32.NewProc("AuditSetSystemPolicy")
-	procLocalFree            = windows.NewLazySystemDLL("kernel32.dll").NewProc("LocalFree")
+	procAuditFree            = modadvapi32.NewProc("AuditFree")
 )
 
 // auditPolicyWithSuccess returns the policy word that audits successes without
@@ -57,19 +56,22 @@ func systemAuditPolicy() (uint32, error) {
 	guid := fileSystemSubcategory
 	var policy *auditPolicyInformation
 
-	ret, _, _ := procAuditQueryPolicy.Call(
+	// AuditQuerySystemPolicy returns a BOOLEAN, not an error code: zero means
+	// failure and non-zero means success. Reading the return value as an errno
+	// makes every successful call look like error 1, "Incorrect function".
+	ok, _, callErr := procAuditQueryPolicy.Call(
 		uintptr(unsafe.Pointer(&guid)),
 		1,
 		uintptr(unsafe.Pointer(&policy)),
 	)
-	// The API returns a ULONG error code, and only its low half is meaningful.
-	if status := uint32(ret); status != 0 {
-		return 0, fmt.Errorf("AuditQuerySystemPolicy: %w", syscall.Errno(status))
+	if ok == 0 {
+		return 0, syscallError(callErr, "AuditQuerySystemPolicy")
 	}
 	if policy == nil {
-		return 0, fmt.Errorf("AuditQuerySystemPolicy returned no policy")
+		return 0, fmt.Errorf("AuditQuerySystemPolicy reported success but returned no policy")
 	}
-	defer procLocalFree.Call(uintptr(unsafe.Pointer(policy)))
+	// The system allocates this structure; AuditFree is its documented release.
+	defer procAuditFree.Call(uintptr(unsafe.Pointer(policy)))
 
 	return policy.AuditingInformation, nil
 }
