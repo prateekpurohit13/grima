@@ -147,10 +147,19 @@ func TestWeightFor(t *testing.T) {
 	}
 }
 
-func TestAttributionDefaultsAreCorrelation(t *testing.T) {
+// The default makes no per-process attribution claim.
+//
+// It was `correlate` until Sprint 2 measured that mode at 0% accuracy and found
+// it actively harmful: filing cumulative evidence against a guessed process
+// fragments a slow drip across unrelated ones, so the cumulative track — the
+// design's answer to drip encryption — never accumulated and a 1-file-per-5s
+// drip reached no alert at all. `host` files every event against the host
+// fingerprint instead, which is what unelevated detection can honestly claim.
+func TestAttributionDefaultsToHost(t *testing.T) {
 	cfg := Default()
-	if cfg.Attribution.Mode != AttributionCorrelate {
-		t.Fatalf("mode = %q, want %q so nothing regresses unelevated", cfg.Attribution.Mode, AttributionCorrelate)
+	if cfg.Attribution.Mode != AttributionHost {
+		t.Fatalf("mode = %q, want %q: per-process attribution requires a causal mechanism",
+			cfg.Attribution.Mode, AttributionHost)
 	}
 	if cfg.Attribution.MaxDelay.Std() <= 0 {
 		t.Fatalf("max_delay = %s, want a positive wait", cfg.Attribution.MaxDelay.Std())
@@ -163,9 +172,11 @@ func TestAttributionModes(t *testing.T) {
 		mode    string
 		wantErr bool
 	}{
-		{"default", AttributionCorrelate, false},
+		{"default", AttributionHost, false},
+		{"host", AttributionHost, false},
+		{"correlate", AttributionCorrelate, false},
 		{"audit", AttributionAudit, false},
-		{"empty means correlate", "", false},
+		{"empty means host", "", false},
 		{"etw is named but not implemented", AttributionETW, true},
 		{"typo", "correlte", true},
 	}

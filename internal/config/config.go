@@ -67,7 +67,15 @@ type AttributionConfig struct {
 
 // Attribution modes.
 const (
-	// AttributionCorrelate blames the largest recent writer. No privileges.
+	// AttributionHost files every event against the host fingerprint. It claims
+	// no per-process attribution, which is the honest default: correlation was
+	// measured at 0% accuracy, and filing cumulative evidence against a guess
+	// fragments it across unrelated processes — which is how a 1-file-per-5s
+	// drip reached no alert at all.
+	AttributionHost = "host"
+	// AttributionCorrelate blames the largest recent writer. No privileges. Kept
+	// because it is the measured baseline the causal path is compared against,
+	// not because it is fit to deploy.
 	AttributionCorrelate = "correlate"
 	// AttributionAudit takes the writer from Windows file-system auditing.
 	AttributionAudit = "audit"
@@ -210,7 +218,7 @@ func Default() Config {
 			SampleInterval: Duration(500 * time.Millisecond),
 		},
 		Attribution: AttributionConfig{
-			Mode:       AttributionCorrelate,
+			Mode:       AttributionHost,
 			MaxDelay:   Duration(300 * time.Millisecond),
 			AuditSetup: true,
 		},
@@ -343,14 +351,14 @@ func (c Config) Validate() error {
 func (c Config) validateAttribution() error {
 	mode := c.Attribution.Mode
 	if mode == "" {
-		mode = AttributionCorrelate
+		mode = AttributionHost
 	}
 	switch mode {
-	case AttributionCorrelate, AttributionAudit:
+	case AttributionHost, AttributionCorrelate, AttributionAudit:
 	case AttributionETW:
 		return fmt.Errorf("attribution.mode %q is not implemented: kernel file events carry a thread id and no path, so ETW needs both a thread-to-process map and a file-object-to-name map; use %q", mode, AttributionAudit)
 	default:
-		return fmt.Errorf("attribution.mode %q is not one of %s, %s", mode, AttributionCorrelate, AttributionAudit)
+		return fmt.Errorf("attribution.mode %q is not one of %s, %s, %s", mode, AttributionHost, AttributionCorrelate, AttributionAudit)
 	}
 	if c.Attribution.MaxDelay.Std() <= 0 {
 		return fmt.Errorf("attribution.max_delay must be positive, got %s", c.Attribution.MaxDelay.Std())

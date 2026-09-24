@@ -11,6 +11,7 @@ import (
 
 // Attribution modes. They are the values of config.AttributionConfig.Mode.
 const (
+	modeHost      = config.AttributionHost
 	modeCorrelate = config.AttributionCorrelate
 	modeAudit     = config.AttributionAudit
 )
@@ -34,7 +35,16 @@ func (a *Attributor) Configure(cfg config.AttributionConfig, paths []string, log
 	a.log = log
 	a.mode = cfg.Mode
 	if a.mode == "" {
-		a.mode = modeCorrelate
+		a.mode = modeHost
+	}
+
+	// Host mode makes no per-process claim: every event is filed against the
+	// host fingerprint. That is the honest default, because correlation was
+	// measured at 0% and filing cumulative evidence against a guess is what
+	// fragments a slow drip across unrelated processes.
+	if a.mode == modeHost {
+		log.Info("attribution mode", "mode", modeHost)
+		return
 	}
 
 	if a.mode == modeCorrelate {

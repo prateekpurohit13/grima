@@ -35,17 +35,28 @@ sample_interval = "2s"
 sample_interval = "1s"
 
 [attribution]
-# How a file event is attributed to a process.
+# Where a file event is filed.
 #
+#   host       make no per-process claim: every event goes to the host
+#              fingerprint. Detection works and nothing is blamed wrongly.
 #   correlate  blame the largest recent writer. No privileges needed, and wrong
-#              whenever another process wrote more bytes in the same window.
+#              whenever another process wrote more bytes in the same window —
+#              measured at 0% accuracy on a known-writer workload. Kept because
+#              it is the baseline the causal path is compared against, not
+#              because it is fit to deploy.
 #   audit      take the writer from Windows file-system auditing: an audit ACE on
 #              each monitored directory makes the Security log report every write
-#              with the process that made it. Needs an elevated process.
+#              with the process that made it. Needs an elevated process, and was
+#              measured at 96.9% with every causal decision correct.
 #
-# A mode that cannot start falls back to correlate with the reason in the log,
-# so the detector keeps running and says why it cannot name the actor.
-mode = "correlate"
+# Prefer host over correlate. Blaming a process the detector cannot identify
+# fragments cumulative evidence across unrelated processes, so a slow drip stops
+# accumulating, and it makes a legitimate burst look like a deviation from
+# whichever quiet process happened to be blamed.
+#
+# A causal mode that cannot start falls back with the reason in the log, so the
+# detector keeps running and says why it cannot name the actor.
+mode = "host"
 
 # How long a file event waits for the audited record before it is attributed by
 # correlation instead. It must exceed the Security log's delivery latency.

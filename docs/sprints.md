@@ -26,6 +26,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 17. [`ngram_rename_chain` Cannot Tell Extraction From Encryption](#17-ngram_rename_chain-cannot-tell-extraction-from-encryption)
 18. [Two Weight-Table Problems The Ablation Must Price](#18-two-weight-table-problems-the-ablation-must-price)
 19. [The Atomic-Save False Positive](#19-the-atomic-save-false-positive)
+20. [Host Mode: Where Evidence Is Filed](#20-host-mode-where-evidence-is-filed)
 
 ---
 
@@ -1222,3 +1223,70 @@ save look like bulk I/O at all?"** The direction of the fix may be a workload-sh
 rather than a weight: distinguishing a save pattern from an encryption pattern needs something
 that sees the *shape*, which no current signal does. Worth deciding before spending a sprint
 tuning numbers.
+
+---
+
+## 20. Host Mode: Where Evidence Is Filed
+
+Sprint 2 item 2.2 failed: a 1-file-per-5s drip produced **no alert**, because the cumulative
+evidence fragmented across four fingerprints (0.480 total, max 20.9). The counters were
+right; the filing was wrong.
+
+### The decision
+
+**Attribution decides where evidence is filed, and a guess is not a filing destination.**
+
+Correlation was measured at 0% accuracy (§11). Filing cumulative evidence against a guessed
+process spreads one slow attack across whichever processes happened to be busy, and the
+cumulative track — the design's answer to Gap 4 — never accumulates. The same guessed process
+was also used as a rate denominator, which is what produced the atomic-save false positive
+(§19).
+
+So a third mode, `host`, is now the default:
+
+| Mode | Attribution | Privileges | Filing |
+|---|---|---|---|
+| **`host`** (default) | none claimed | none | host fingerprint |
+| `correlate` | largest recent writer | none | per-process — **0% accurate, kept only as the measured baseline** |
+| `audit` | OS-reported writer | elevation | per-process |
+
+`correlate` is retained deliberately: it is the comparison the causal path is measured
+against, not something fit to deploy.
+
+### Result
+
+Drip encryption, 20 files at one per 5 seconds, host mode:
+
+| | Before | After |
+|---|---|---|
+| Alerts | **0** | **85**, `score=100.0 level=critical` |
+| Signals | — | `entropy_deviation; magic_mismatch; unknown_extension_activity` |
+
+**Detection works where it previously did not.** But the exit criterion is only half met, and
+saying otherwise would be dishonest:
+
+- ✅ "crosses threshold" — yes, at critical;
+- ❌ "while the decaying window stays flat" — **no.** `entropy_deviation` fired from the
+  window, so the window was not flat.
+
+The criterion's second clause assumed per-process filing, where a slow drip spreads thin
+across a window. Under host aggregation the window sees every event, so it catches a drip on
+its own and the cumulative track is not *necessary* to the result — it contributed
+(`unknown_extension_activity`) but is no longer load-bearing.
+
+**What this means for the paper:** the dual-track claim should be restated as it actually
+behaves. The honest version is "host-level aggregation is what makes a slow drip detectable;
+the cumulative track survives decay and contributes, but the window is not flat in this
+mode." The claim that decay alone would miss a drip is true of per-process filing and is no
+longer the configuration we ship.
+
+### Why this is the long-term choice
+
+The alternative — keep per-process filing and accept that drip detection requires elevation —
+would make the design's answer to Gap 4 a privileged feature. Host mode makes it the default
+and keeps per-process attribution as the upgrade it actually is.
+
+This also removes the class of defect rather than instances of it: `write_burst` no longer
+has an arbitrary denominator (§19), cumulative counters no longer fragment (§20), and no
+verdict names a process the detector cannot identify. Verdicts now read `pid=0 process=(host)`,
+which is true.

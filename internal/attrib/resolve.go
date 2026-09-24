@@ -44,6 +44,16 @@ func (a *Attributor) Resolve(ev event.Event, emit func(event.Event)) {
 		emit(ev)
 		return
 	}
+
+	// Host mode: no per-process claim is made, so the event keeps PID 0 and is
+	// filed against the host fingerprint. Guessing here would spread one slow
+	// drip across whichever processes happened to be busy, and the cumulative
+	// track — the design's answer to drip encryption — would never accumulate.
+	if a.mode == modeHost {
+		emit(ev)
+		return
+	}
+
 	if a.pending == nil {
 		a.attribute(&ev)
 		emit(ev)
