@@ -999,3 +999,53 @@ joins, and it contributes identically for a benign extractor and a real encrypto
 
 This is the useful outcome of implementing rather than deleting: the gap is closed, and what
 the signal actually buys is now known instead of assumed.
+
+### The weight narrows the margin; it does not remove the false positive
+
+Measured against the real scorer with noisy-OR fusion, extraction shape, calibrated baseline
+with per-kind rates high enough that no burst signal fires:
+
+| Workload | w=0.2 (shipped) | w=0.5 (previous) | w=0 |
+|---|---|---|---|
+| Extraction, no companion | 20.0 info | 50.0 medium | 0.0 info |
+| Extraction + magic on 10% of writes | 36.0 low | 60.0 medium | 20.0 info |
+| Extraction + magic on 25% of writes | **60.0 medium** | 75.0 high | 50.0 medium |
+| Extraction + entropy +2σ | **46.7 medium** | 66.7 medium | 33.3 low |
+| Extraction + entropy +3σ | **60.0 medium** | 75.0 high | 50.0 medium |
+| Extraction + unknown extension | 100.0 critical | 100.0 critical | 100.0 critical |
+
+The band rule, derivable from noisy-OR and matching the table: at weight $w$ the signal lifts
+a companion score in $\left[\left(1 - \frac{0.55}{1-w}\right) \cdot 100,\ 45\right)$ from low
+over the medium band. At $w = 0.2$ that is **31.25 to <45**; at $w = 0.5$ it was **0 to <45** —
+any companion at all, which is why a benign extraction alerted alone at 50.0 live.
+
+So 0.2 is a real improvement, not a fix. A benign extraction whose only other evidence is a
+mild entropy deviation scores **33.3 (low, no alert) without the signal and 46.7 (medium,
+alert) with it**. `ngram_rename_chain` is not what alerts in that case — it is what carries the
+combination over the band.
+
+**The argument for deleting it.** The signal carries no information beyond "this process
+renamed a file it wrote", which the content signals already measure, and noisy-OR treats the
+two as independent evidence, so it **over-counts**. That is the real case for weight 0 or
+deletion. The counter-argument, and why the weight stays at 0.2 for now: a zero-weight signal
+makes the Sprint 4 ablation vacuous for it — a subset comparison cannot show a change if the
+signal cannot change anything.
+
+A test pins the invariant the shipped weight encodes: a benign extraction scored with the
+signal alone must stay below the medium band. Raising the weight back to 0.5 would fail a
+test rather than pass silently.
+
+### Extraction is a false-positive class with or without this signal
+
+The more consequential finding, and it is not about `ngram_rename_chain`: **`extraction +
+unknown extension` scores 100 (critical) with the signal contributing nothing.** A host whose
+baseline has never seen the extracted extension alerts on `unknown_extension_activity`
+(weight 1.0) alone.
+
+That is inherent to novelty detection — a first-seen extension genuinely is novel — and
+recalibration is the mitigation: a recurring benign workload has its extensions promoted and
+stops alerting, which was verified end to end (§16). But a **first-time** benign extraction
+of an unfamiliar file type alerts, and no weight tuning changes that.
+
+When Sprint 4 prices the extraction workload, `ngram_rename_chain` is neither the only nor the
+largest contributor. Attributing that FP class to it would be wrong.
