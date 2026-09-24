@@ -240,12 +240,15 @@ thing to cut, not the harness.
 
 ## 8. Risks
 
-1. **Process→file attribution is correlation, not causation.** User-space APIs report
-   *that* a file changed and *which* processes exist, but not always *which process
-   wrote it*. Mitigation: attribute via `ReadDirectoryChangesW`/inotify event timing
-   correlated with per-process I/O counters, and treat attribution confidence as a
-   first-class field. If stronger attribution is needed later, ETW on Windows and
-   auditd on Linux are OS-provided and still avoid custom drivers.
+1. **Process→file attribution was correlation, not causation — now measured and fixed.**
+   User-space APIs report *that* a file changed and *which* processes exist, but not *which
+   process* wrote it. Correlating against per-process I/O counters was measured at **0%**
+   accuracy (1,255 decisions, solo writer): a background process writing more bytes always
+   outcompetes one writing many small files, and the writer is not even a candidate.
+   **Resolved** by causal attribution — Windows file-system auditing (Security event 4663)
+   behind `attribution.mode`, measured at **96.9%** on an elevated host, with every causal
+   decision correct. See `sprints.md` §11 and §14. Elevation is now a deployment
+   requirement rather than a limitation of the approach.
 2. **Event loss under load.** `watchdog`-style buffers overflow during encryption
    storms; inotify has watch limits. Mitigation: handle overflow by re-scanning the
    subtree, and treat bus drop rate as its own signal rather than a silent failure.

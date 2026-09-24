@@ -16,9 +16,9 @@ phases are; this says *who does what, in what order, and how we know it is finis
 7. [Critical Path](#7-critical-path)
 8. [Cut List](#8-cut-list)
 9. [Known Gaps Carried Into Sprint 1](#9-known-gaps-carried-into-sprint-1)
-10. [What Dropping Linux Costs](#10-what-dropping-linux-costs)
+10. [Platform Verification](#10-platform-verification)
 11. [Attribution: The Measured Result](#11-attribution-the-measured-result)
-12. [Why Item 1.5 Is Blocked](#12-why-item-15-is-blocked)
+12. [Why ETW Was Rejected](#12-why-etw-was-rejected)
 13. [Detection No Longer Depends On Attribution](#13-detection-no-longer-depends-on-attribution)
 14. [Causal Attribution: What Landed](#14-causal-attribution-what-landed)
 15. [Fusion Was Not Monotonic](#15-fusion-was-not-monotonic)
@@ -128,8 +128,8 @@ the sensors are accurate.
 | 1.1 | Overflow rescan | **Done.** Extracted `handleWatchError` so the branch is reachable; 6 tests. Revert-checked: removing the `rescan` call makes the test fail. |
 | 1.2 | PersistWatch verified | **Done.** 9 tests; 17 baseline entries catalogued on this host; a new Startup-folder entry detected at runtime; pre-existing entries correctly silent. |
 | 1.3 | ProcWatch cost | **Done.** 14–49 ms per sample pass, ≈1.4–4.9% of one core at the 1 s default — the default is justified. 167 processes return empty `Exe()`/`Cmdline()` on this host, with no error, which bounds what attribution can rely on. |
-| 1.4 | **Attribution accuracy** | ❌ **FAILED.** Measured 0% (1,255 decisions over 5 rounds, solo writer). Exit criterion was ≥90%. A causal mechanism now exists behind `attribution.mode = "audit"`, but the number still has to be taken on an elevated host — §14. |
-| 1.5 | Attribution upgrade | 🟡 **IMPLEMENTED, UNMEASURED.** ETW was evaluated and rejected for this delivery; Windows file-system auditing (Security event 4663) is implemented behind a config flag, with correlation as the fallback, and unit-tested unelevated. One elevated run scores the gate: `testdata/scenarios/verify_attribution.ps1`. Evidence and reasoning in §14. |
+| 1.4 | **Attribution accuracy** | ✅ **PASSED — 96.9%.** Correlation measured 0%; causal attribution measured 945 of 975 decisions over 5 rounds on an elevated host. Gate was ≥90%. Every causal decision was correct — the residual 3.1% is the correlation fallback, which fails at the same 0% rate as before. See §11. |
+| 1.5 | Attribution upgrade | ✅ **Complete.** Windows file-system auditing (Security event 4663) implemented behind `attribution.mode`, verified on an elevated host. ETW was evaluated and rejected on evidence. See §14. |
 | 1.6 | Decoy touch fires | **Done.** `KindDecoyTouch` + `DecoyID` verified in unit tests and end to end at critical. |
 | 1.7 | Sensor health honesty | **Done.** `Reporting` on `sensor.Stats`; 5 tests over the `/healthz` shape a consumer parses. |
 | 1.8 | Linux smoke test | ✅ **Done, via CI instead of WSL.** The ubuntu job runs `smoke-linux.sh`: all three sensors report, `filewatch` produces events, `persistwatch` scans real locations, the benign workload stays silent, and the encryptor is detected with content-derived signals. Reproducible by anyone — see §10. |
@@ -304,7 +304,7 @@ Verified against the code, not assumed:
 | Gap | Evidence | Where it lands |
 |---|---|---|
 | **`window.ngram_length` is dead config** | Parsed, defaulted, validated — never read. No n-gram feature or signal exists, though `design.md` §6 and `architecture.md` §6 both describe one | Sprint 2 item 2.1 |
-| **Attribution is unreliable — measured** | Sprint 1 measured 0% accuracy on the solo-writer case (1,255 decisions, 5 rounds). Detection unaffected. See §11 | Sprint 2: adopt ETW/auditd, or reframe to tree-level claims |
+| ~~Attribution unreliable~~ | **Resolved in Sprint 1** — correlation measured 0%, causal attribution measured 96.9%. Elevation is now a deployment requirement, not a gap | Done; see §11 |
 | ~~Decoy touch never observed firing~~ | **Resolved in Sprint 1** — verified in unit tests and end to end at critical | Done |
 | **Suspend path untested** | Implemented for Windows and POSIX, never executed | Sprint 3 item 3.2 |
 | ~~Overflow rescan untested~~ | **Resolved in Sprint 1** — 6 tests, revert-checked so the test fails if the rescan call is removed | Done |
@@ -358,13 +358,41 @@ paper's Threats to Validity must say so.
 
 ## 11. Attribution: The Measured Result
 
-Sprint 1 item 1.4 asked whether the detector can name the process that wrote a file. The
-answer is **no**, and the measurement is unambiguous.
+Sprint 1 item 1.4 asked whether the detector can name the process that wrote a file. Two
+mechanisms were measured, and they differ by 97 points.
 
-### The number
+### Result
 
-Condition: solo writer, 65 files of 4 KiB, no deliberate background load — the *easiest*
-case, with exactly one process doing the writing. Five rounds:
+| Mechanism | Decisions | Correct | Accuracy | Gate (≥90%) |
+|---|---|---|---|---|
+| Correlation on write volume | 1,255 | 0 | **0.0%** | ❌ failed |
+| Causal (Windows file-system auditing) | 975 | 945 | **96.9%** | ✅ **met** |
+
+The causal run: solo writer, 65 files of 4 KiB, five rounds on an elevated host.
+
+| Round | Writer PID | Decisions | Correct | Accuracy | Causal | Correlate |
+|---|---|---|---|---|---|---|
+| 1 | 20440 | 195 | 189 | 96.9% | 189 | 6 |
+| 2 | 6020 | 195 | 189 | 96.9% | 189 | 6 |
+| 3 | 10700 | 195 | 189 | 96.9% | 189 | 6 |
+| 4 | 18068 | 195 | 189 | 96.9% | 189 | 6 |
+| 5 | 7264 | 195 | 189 | 96.9% | 189 | 6 |
+| **Total** | — | **975** | **945** | **96.9%** | 945 | 30 |
+
+**The breakdown matters more than the headline.** `correct` equals `causal` in every round:
+**every decision the causal mechanism resolved was correct.** The residual 3.1% is the
+correlation fallback — the six events per round whose audited record did not arrive inside
+`max_delay` — and those fail at the same 0% rate the correlation path always had.
+
+So the honest reading is not "96.9% accurate attribution". It is: **causal attribution was
+100% accurate; correlation remains 0%; the blend is 96.9% and is tunable by raising
+`max_delay`.**
+
+### The correlation number
+
+Correlation against write volume, measured first and kept here because it is the baseline the
+causal result is compared against. Condition: solo writer, 65 files of 4 KiB, no deliberate
+background load — the *easiest* case, with exactly one process doing the writing.
 
 | Round | Writer PID | Decisions | Correct | Accuracy | Blamed instead |
 |---|---|---|---|---|---|
@@ -375,11 +403,10 @@ case, with exactly one process doing the writing. Five rounds:
 | 5 | 15584 | 260 | 0 | 0.0% | `firefox.exe` ×260 |
 | **Total** | — | **1,255** | **0** | **0.0%** | — |
 
-Across every other condition tested (paced writes, 4 MiB files, with and without a
-deliberate background writer) the best observed rate was **19.1%**. The 90% bar is not
-merely unmet; the mechanism does not work.
+Across every other condition tested (paced writes, 4 MiB files, with and without a deliberate
+background writer) the best observed rate was **19.1%**.
 
-### Why it fails
+### Why correlation fails
 
 `Suspect` picks the process with the largest recent write-*byte* delta. A browser writing
 hundreds of kilobytes to its cache in the same sample interval beats a process writing 65
@@ -432,11 +459,15 @@ not. The paper should make tree-level claims, not per-process ones.
 
 ---
 
-## 12. Why Item 1.5 Is Blocked
+## 12. Why ETW Was Rejected
 
-Item 1.5's exit criterion names a mechanism: *ETW (`Microsoft-Windows-Kernel-File`) on
-Windows; no custom driver*. Three facts, each verified on this host, put it out of reach
-here.
+**Resolved.** Item 1.5 is complete: causal attribution was implemented via Windows file-system
+auditing and measured at 96.9% (§11). This section is kept because the reasoning is the
+justification for choosing auditing over ETW, and because the constraint it identified —
+elevation — still governs how the feature is deployed.
+
+Item 1.5's exit criterion named a mechanism: *ETW (`Microsoft-Windows-Kernel-File`) on
+Windows; no custom driver*. Three facts, each verified on this host, put ETW out of reach.
 
 ### 1. The named mechanism requires elevation
 
@@ -496,19 +527,21 @@ The second is defensible, testable, and honest. It also explains why the detecto
 designed so that detection does not *depend* on attribution — the file-derived signals
 (entropy, magic bytes, extension novelty) carry the verdict regardless.
 
-### To unblock
+### How it was resolved
 
-1. **Run elevated.** Implement ETW consumption behind a build tag or a config flag, and
-   measure with an elevated detector. Only then can the ≥90% gate be tested at all.
-   *Status: the flag and the mechanism now exist (§14, `attribution.mode = "audit"`); the
-   elevated measurement has not been taken, so 1.4 stays failed.*
-2. **Re-scope the gate.** If the deployment cannot be elevated, replace 1.4's ≥90% with a
-   stated bound: "per-process attribution is unavailable unelevated; tree-level attribution
-   is used instead." This is a legitimate re-scope, but it must be an explicit decision
-   recorded here, not a quietly lowered bar.
+Option 1 was taken: the mechanism was implemented behind `attribution.mode`, and the
+measurement was taken on an elevated host. **96.9% — the gate is met (§11).**
 
-Either way, **the gate stays failed until one of these is chosen.** Do not mark 1.4 complete
-on the strength of having measured the failure.
+The second option was not needed, and should not be reached for now that the first has
+worked. Recording it here only so the reasoning is not re-derived:
+
+- Re-scoping the gate to "attribution unavailable unelevated" would have been legitimate
+  **only** as an explicit decision, not as a quiet lowering of the bar. It is moot.
+
+The elevation constraint has not gone away. It is now a **deployment requirement**: causal
+attribution needs `SeSecurityPrivilege` plus an audit ACE per monitored directory, so a
+default install runs on correlation and is blind to the actor. That belongs in the paper as
+a deployment note, not buried here.
 
 ---
 
@@ -752,8 +785,22 @@ reason, fell back to correlation, and kept running rather than failing to start.
 also correctly refused to report a number it had not measured, printing "the audit mechanism
 never started, so this run does not measure it" instead of a misleading 0%.
 
-**The measurement is still outstanding.** Re-run the same command; the fix is in the detector,
-so no change to the procedure is needed.
+**The measurement was then taken.** Re-running the same command on an elevated host started
+`mode=audit` cleanly and produced:
+
+| Round | Decisions | Correct | Accuracy | Causal | Correlate |
+|---|---|---|---|---|---|
+| 1–5 (each) | 195 | 189 | 96.9% | 189 | 6 |
+| **Total** | **975** | **945** | **96.9%** | **945** | 30 |
+
+**Gate met.** Every causal decision was correct; the residual 3.1% is the correlation
+fallback. The full breakdown is in §11.
+
+**One tuning note for later.** The 30 correlated decisions are events whose audited record
+did not arrive inside `max_delay` (default 150 ms). Since the causal path is 100% accurate and
+the fallback is 0%, raising `max_delay` should raise the blended figure toward 100% at the
+cost of added latency. Worth measuring in Sprint 2 alongside the other calibration work,
+rather than assuming the current 96.9% is the ceiling.
 
 ---
 
