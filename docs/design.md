@@ -421,11 +421,18 @@ func (s *Scorer) Evaluate(tv fingerprint.TreeVector, b *calibrate.Baseline) Verd
 
 ### Fusion algorithm
 
-1. **Weighted sum.** $\text{raw} = \sum_i w_i \cdot v_i$ over Primary and Secondary
-   signals, where $w_i$ comes from configuration. Weights are normalized so the raw sum
-   is in `[0,1]`, then scaled to `0..100`.
+1. **Independent evidence, not an average.** Signals combine as
+   $\text{score} = 100 \left(1 - \prod_i \left(1 - \mathrm{clamp}_{[0,1]}(w_i \cdot v_i)\right)\right)$
+   over Primary and Secondary signals, where $w_i$ comes from configuration.
+
+   This is noisy-OR, and the choice is deliberate. A weighted mean is **not monotonic**:
+   adding a weak signal lowers the score, so a saturated signal alone scored 100 while the
+   same signal alongside three weaker ones scored 56.4 — more evidence of the same attack
+   reading as less severe. That is not a hypothetical: it is the difference between a local
+   run and CI on an identical scenario (`sprints.md` §15). A risk score must be monotonic in
+   its evidence, so evidence can only add.
 2. **Override floor.** For each Override signal present, `level = max(level, rule_severity)`
-   and `Override` is set to the rule ID. Overrides are **never** averaged; they set a
+   and `Override` is set to the rule ID. Overrides are **never** combined; they set a
    minimum.
 3. **Decay.** The decaying track's contribution is reduced by
    `exp(-Δt / decay_half_life)` when no further suspicious activity follows. The

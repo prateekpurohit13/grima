@@ -21,6 +21,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 12. [Why Item 1.5 Is Blocked](#12-why-item-15-is-blocked)
 13. [Detection No Longer Depends On Attribution](#13-detection-no-longer-depends-on-attribution)
 14. [Causal Attribution: What Landed](#14-causal-attribution-what-landed)
+15. [Fusion Was Not Monotonic](#15-fusion-was-not-monotonic)
 
 ---
 
@@ -753,3 +754,60 @@ never started, so this run does not measure it" instead of a misleading 0%.
 
 **The measurement is still outstanding.** Re-run the same command; the fix is in the detector,
 so no change to the procedure is needed.
+
+---
+
+## 15. Fusion Was Not Monotonic
+
+CI failed the Windows smoke test after the attribution fix. The log showed the detector had
+worked:
+
+```
+level=WARN msg="ransomware risk detected" pid=5872 process=bash.exe
+score=56.4 level=medium signals="unknown_extension_activity; entropy_deviation; magic_mismatch; write_burst"
+```
+
+Detection was correct — the right signals, on the right activity. The **level** was the
+problem: 56.4 (medium) where the same scenario had scored **100 (critical)** locally.
+
+### Why
+
+Fusion combined signals as a weighted **mean**:
+
+$$\text{score} = 100 \cdot \frac{\sum_i w_i v_i}{\sum_i w_i}$$
+
+A mean is not monotonic. Adding a weak signal *lowers* the score, because it enlarges the
+denominator without adding much to the numerator. So:
+
+| Run | Signals present | Score | Level |
+|---|---|---|---|
+| Local | `unknown_extension_activity` alone (saturated, 1.0) | **100.0** | critical |
+| CI | the same signal + `entropy_deviation` + `magic_mismatch` + `write_burst` | **56.4** | medium |
+
+**More evidence of the same attack produced a lower severity.** The local run was *less*
+informed — its content signals had raced against the rename and found nothing — and scored
+*higher* for it.
+
+That is a correctness defect in the core scorer, not a test threshold. A risk score whose
+value falls as evidence accumulates cannot be reasoned about, and it would have distorted
+every number in the Sprint 4 ablation.
+
+### The fix
+
+Signals now combine as independent evidence:
+
+$$\text{score} = 100 \left(1 - \prod_i \left(1 - \mathrm{clamp}_{[0,1]}(w_i v_i)\right)\right)$$
+
+This is noisy-OR, and monotonicity is the property being bought: adding a signal can only
+raise the score. A saturated signal alone still reaches 100; the same signal with three
+weaker companions now reaches 100 as well rather than being averaged down to 56.
+
+`TestAddingEvidenceNeverLowersTheScore` pins the invariant, asserting both that the second
+verdict carries more signals and that its score is not lower.
+
+### What it says about the evaluation
+
+Two runs of one scenario disagreed by 44 points, and the disagreement was **environmental** —
+whether the detector read a file before or after it was renamed. That is a reminder for
+Sprint 4: TTD and detection-rate numbers taken from a single run are not trustworthy, and the
+harness has to report variance across rounds rather than one figure.

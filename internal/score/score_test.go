@@ -175,3 +175,39 @@ func TestKnowsExtTreatsUnknownAsUnknown(t *testing.T) {
 		t.Fatal("an empty extension should not be reported as unknown")
 	}
 }
+
+// Adding evidence must never lower the score.
+//
+// A weighted mean fails this, and that is not hypothetical: the same encryption
+// burst scored 100 (critical) on a local run where one signal fired, and 56.4
+// (medium) in CI where four fired, because the saturated signal was averaged
+// against three weaker ones. More evidence of the same attack read as less
+// severe.
+func TestAddingEvidenceNeverLowersTheScore(t *testing.T) {
+	scorer := NewScorer(config.Default())
+	baseline := testBaseline()
+
+	base := fingerprint.TreeVector{
+		Root:           1,
+		ProcName:       "cryptor",
+		WindowDuration: time.Second,
+		ExtActivity:    map[string]int64{".locked": 60},
+	}
+	more := base
+	more.Writes = 500
+	more.Entropy = []fingerprint.EntropySample{{Ext: ".docx", H: 7.9}}
+	more.MagicTotal = 500
+	more.MagicMismatch = 500
+
+	fewer := scorer.Evaluate(Inputs{Tree: base, Baseline: baseline})
+	extra := scorer.Evaluate(Inputs{Tree: more, Baseline: baseline})
+
+	if len(extra.Signals) <= len(fewer.Signals) {
+		t.Fatalf("the second verdict should carry more signals: %d then %d",
+			len(fewer.Signals), len(extra.Signals))
+	}
+	if extra.Score < fewer.Score {
+		t.Fatalf("more evidence scored lower: %.1f with %d signals, %.1f with %d",
+			fewer.Score, len(fewer.Signals), extra.Score, len(extra.Signals))
+	}
+}

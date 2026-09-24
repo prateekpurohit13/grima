@@ -130,8 +130,14 @@ func (s *Scorer) Evaluate(in Inputs) Verdict {
 		EvaluatedAt: time.Now(),
 	}
 
-	// Weighted mean over non-override signals, scaled to 0..100.
-	var weighted, totalWeight float64
+	// Independent signals combine as independent evidence, not as an average.
+	//
+	// With a weighted mean, adding a weak signal LOWERS the score: a saturated
+	// extension-novelty signal alone scored 100, while the same signal alongside
+	// three weaker ones scored 56.4, so more evidence of the same attack read as
+	// less severe. Noisy-OR is monotonic — a signal can only add — which is the
+	// property a risk score has to have.
+	combined := 1.0
 	for _, sg := range signals {
 		if sg.Class == ClassOverride {
 			continue
@@ -140,12 +146,9 @@ func (s *Scorer) Evaluate(in Inputs) Verdict {
 		if w <= 0 {
 			continue
 		}
-		weighted += w * sg.Value
-		totalWeight += w
+		combined *= 1 - clamp01(w*sg.Value)
 	}
-	if totalWeight > 0 {
-		v.Score = (weighted / totalWeight) * 100
-	}
+	v.Score = (1 - combined) * 100
 	v.Level = s.levelFor(v.Score)
 
 	// Overrides set a floor and are never averaged away by benign signals.
