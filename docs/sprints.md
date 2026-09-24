@@ -28,6 +28,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 19. [The Atomic-Save False Positive](#19-the-atomic-save-false-positive)
 20. [Host Mode: Where Evidence Is Filed](#20-host-mode-where-evidence-is-filed)
 21. [The npm False Positive, and One Unreproduced Claim](#21-the-npm-false-positive-and-one-unreproduced-claim)
+22. [The `max_delay` Curve, and a Coupling It Exposed](#22-the-max_delay-curve-and-a-coupling-it-exposed)
 
 ---
 
@@ -203,12 +204,12 @@ results were surprising, not because the sprint finished short.
 | 2.6 | Tree aggregation under a real split | ✅ **Done, under per-process attribution** — the only configuration where it can be met. Split workload measured: tree 63.2 medium while each child stays silent. See §20. |
 | 2.7 | Fingerprint memory bound | ✅ **Done.** Ring wrap and 500×20 start/exit cycles pinned. |
 | 2.8 | Benign corpus | ✅ **Met**, with a deviation: npm measured at 50 packages rather than 200, because the scripted default could not be measured at all. Four of five workloads silent; **npm is a genuine false positive** (§21). |
-| 2.9 | `max_delay` tuning | ❌ **Not done.** Needs an elevated run. |
+| 2.9 | `max_delay` tuning | ✅ **Done.** Curve measured on an elevated host; default set to 500 ms, the best point, and the delay/window coupling bounded. See §22. |
 | 2.10 | Report spread, not one figure | ✅ **Done.** `benign-fp-spread.sh` reports N-round spread. |
 | 2.11 | Re-baseline smoke thresholds | ✅ **Done.** Assertions tightened in both smoke scripts. |
 
-**Nine met, one half, one unverified, one outstanding.** 2.9 is the only item blocked on
-something outside the repo — one elevated run.
+**Ten met, one half, one unverified.** Every item that can be closed without external
+input is closed.
 
 **Two things this table records that the sprint would otherwise have hidden.** 2.2's criterion
 was met in outcome and not in mechanism, and the honest reading is in §20 rather than a tick.
@@ -1415,3 +1416,73 @@ Both start in well under a second. **Not reproduced.** It may have been specific
 tree's shape — `node_modules` contains symlinks and deep nesting — or a misreading of a slow
 run. Recorded as unreproduced rather than dismissed, because a sensor that can hang is a
 fail-safe violation and worth a targeted test if anyone sees it again.
+
+---
+
+## 22. The `max_delay` Curve, and a Coupling It Exposed
+
+Item 2.9 asked for the accuracy/latency curve rather than a value that landed somewhere.
+Measured on an elevated host, 3 rounds per delay, 195 decisions per round:
+
+| `max_delay` | Accuracy | Correct | Causal | Fallback | Causal correct? |
+|---|---|---|---|---|---|
+| 100 ms | 90.4% | 529 / 585 | 529 | 56 | **100%** |
+| 300 ms | 96.9% | 567 / 585 | 567 | 18 | **100%** |
+| **500 ms** | **98.5%** | **576 / 585** | **576** | 9 | **100%** |
+| 1 s | 84.6% | 495 / 585 | 583 | 2 | **84.9%** ❌ |
+
+**The curve is not monotonic, and the reason is a coupling, not noise.**
+
+Up to 500 ms the shape is what was expected: a longer wait captures more of the late
+records, so fewer events fall back to correlation, and accuracy rises 90.4% → 96.9% → 98.5%.
+Causal attribution is 100% correct at all three.
+
+At 1 s it inverts. `causal` rises to 583 — nearly every event is now attributed causally — but
+`correct` *falls* to 495. **88 causal decisions were wrong.** Two of the three rounds scored
+150/195 while the first scored 195/195, so it degraded after the first round at that setting.
+
+### The cause
+
+`causalWindow` was `4 × delay`, floored at 2 s:
+
+| `max_delay` | Window | Outcome |
+|---|---|---|
+| 100 ms | 2 s (floor) | 100% causal correct |
+| 300 ms | 2 s (floor) | 100% causal correct |
+| 500 ms | 2 s | 100% causal correct |
+| **1 s** | **4 s** | **84.9% causal correct** |
+
+The matcher returns the newest record for a path within the window. A 4 s window is long
+enough to **span two rounds of the same workload**, and rounds reuse the same paths in a fresh
+directory. So a late event that timed out found a **stale record from the previous round** and
+was blamed on the previous round's writer — a real match, to the wrong write.
+
+Every setting whose window stayed at 2 s avoided this because the previous round's records had
+expired before the next began.
+
+**So the delay and the matching window were coupled by a multiplier, and raising one silently
+raised misattribution risk in the other.** Nothing about `max_delay = 1s` is unreasonable on
+its face; it was the window that made it bad.
+
+### The decisions
+
+**1. Default is now 500 ms**, the best measured point: 98.5% with causal attribution 100%
+correct. It captures 9 of the 10 late events that 300 ms missed, and the cost is 200 ms of
+additional detection latency on the events that need it — small against a metric measured in
+files encrypted.
+
+**2. The coupling is bounded.** `causalWindow` is now `max(2 s, delay + 250 ms)` rather than
+`4 × delay`. At 500 ms that is 2 s — **identical to the configuration measured above**, so the
+result stands. At 1 s it is 2 s rather than 4 s, which removes the stale-match path.
+
+**1 s has not been re-measured with the fix**, and the honest statement is that 500 ms is the
+best *measured* point, not that it is provably optimal. If a longer delay is ever wanted, the
+sweep should be re-run — it is one command.
+
+### What this says about the method
+
+The value that shipped before this run — 300 ms — was chosen by the agent that implemented the
+mechanism. It happened to be reasonable, but it was not chosen from a measurement, and the
+measurement shows it leaves 1.6 points on the table while a value one step further would have
+been actively harmful. **A parameter that looks like a latency knob was also a correctness
+knob**, and only a sweep showed that.

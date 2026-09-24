@@ -60,7 +60,7 @@ mode = "host"
 
 # How long a file event waits for the audited record before it is attributed by
 # correlation instead. It must exceed the Security log's delivery latency.
-max_delay = "300ms"
+max_delay = "500ms"
 
 # Let GRIMA enable the File System audit subcategory and set the audit ACE on
 # every monitored directory. Set false to leave host auditing alone and manage

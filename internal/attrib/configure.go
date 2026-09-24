@@ -18,7 +18,7 @@ const (
 
 // defaultMaxDelay is how long a file event waits for a causal record when the
 // configuration does not say.
-const defaultMaxDelay = 300 * time.Millisecond
+const defaultMaxDelay = 500 * time.Millisecond
 
 // Configure attaches the causal source named by the configuration.
 //
@@ -103,16 +103,26 @@ func resolveDelay(cfg config.AttributionConfig) time.Duration {
 	return delay
 }
 
-// causalWindow is how long a causal record stays usable. It is wider than the
-// wait, because the record has to survive from the write to the file event that
-// asks about it.
+// causalWindow is how long a causal record stays usable.
+//
+// It must exceed the wait, because the record has to survive from the write to
+// the file event that asks about it. It must not grow without bound: a window
+// long enough to span two workloads lets a STALE record satisfy a late event, so
+// the blame lands on whoever wrote that path last time. Measured — at
+// max_delay 1s the window was 4s and accuracy fell to 84.6% with 88 causal
+// decisions wrong, while every setting whose window stayed at 2s held 100%
+// causal correctness.
 func causalWindow(delay time.Duration) time.Duration {
-	window := 4 * delay
+	window := delay + causalWindowMargin
 	if window < 2*time.Second {
 		window = 2 * time.Second
 	}
 	return window
 }
+
+// causalWindowMargin is the slack a record needs beyond the wait it may serve,
+// covering the gap between the write and the event that reports it.
+const causalWindowMargin = 250 * time.Millisecond
 
 // sourceOptions are what a causal source needs to start.
 type sourceOptions struct {
