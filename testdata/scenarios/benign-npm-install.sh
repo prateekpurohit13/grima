@@ -25,6 +25,7 @@ echo "work directory: $WORK"
 start="$(date +%s)"
 files=0
 bytes=0
+renames_failed=0
 
 write_file() {
   printf '%s' "$2" > "$1"
@@ -49,9 +50,12 @@ for p in $(seq 1 20); do
   dir="$WORK/node_modules/pkg-$p"
   for m in $(seq 1 3); do
     printf 'module.exports = function rewritten_%s_%s(v) { return v + %s; };\n' "$p" "$m" "$p" > "$dir/lib/mod_$m.js.tmp"
-    mv "$dir/lib/mod_$m.js.tmp" "$dir/lib/mod_$m.js"
-    files=$((files + 1))
-    bytes=$((bytes + $(wc -c < "$dir/lib/mod_$m.js")))
+    if mv "$dir/lib/mod_$m.js.tmp" "$dir/lib/mod_$m.js" 2>> "$WORK/rename-errors.log"; then
+      files=$((files + 1))
+      bytes=$((bytes + $(wc -c < "$dir/lib/mod_$m.js")))
+    else
+      renames_failed=$((renames_failed + 1))
+    fi
   done
 done
 
@@ -69,4 +73,4 @@ files=$((files + 1))
 bytes=$((bytes + $(wc -c < "$lock")))
 
 elapsed=$(( $(date +%s) - start ))
-echo "SUMMARY scenario=npm_install files_written=$files bytes_written=$bytes elapsed_s=$elapsed packages=$PKGS"
+echo "SUMMARY scenario=npm_install files_written=$files bytes_written=$bytes elapsed_s=$elapsed packages=$PKGS renames_failed=$renames_failed"

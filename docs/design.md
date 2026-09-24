@@ -392,8 +392,11 @@ type NGram struct {
 - Because of that overlap the signal ships with a **weight of 0.2**, where `bus_drops`
   sits: at full value a benign extraction scores 20 — under the medium alert band — so it
   corroborates the content signals on a real encryptor instead of raising an alert by
-  itself. Sprint 4's ablation still has to report its per-scenario false-positive rate
-  before the paper cites it.
+  itself. Weight is not safety, only margin: measured against the fusion, the signal still
+  lifts a companion score of 31–45 (below the medium band on its own) over it, so a benign
+  extraction that also shows a mild content deviation reaches medium, and the signal is
+  what carries it there. Sprint 4's ablation has to price that per scenario before the
+  paper cites it.
 
 `score` turns it into signal #14, `ngram_rename_chain`; whether it earns its weight is
 Sprint 4's ablation. Item 2.1 is closed by this — the gap it recorded (a parsed-but-unread

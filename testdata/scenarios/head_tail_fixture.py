@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def plaintext(path: str, size: int, extension: str) -> bytes:
+def plaintext(size: int, extension: str) -> bytes:
     magic = MAGIC[extension]
     filler = []
     line = 0
@@ -95,7 +95,7 @@ def main() -> int:
     for i in range(1, args.files + 1):
         path = os.path.join(target, f"partial_{i}{args.extension}")
         with open(path, "wb") as handle:
-            handle.write(plaintext(path, args.size_bytes, args.extension))
+            handle.write(plaintext(args.size_bytes, args.extension))
         offset = 0 if args.region == "head" else args.size_bytes - args.bytes
         with open(path, "r+b") as handle:
             handle.seek(offset)
@@ -115,7 +115,9 @@ def main() -> int:
         print(f"{path}: region={args.region} size={len(body)} "
               f"head_entropy={h:.2f} tail_entropy={t:.2f} sampled_entropy={c:.2f}")
 
-    mean = lambda xs: sum(xs) / len(xs)  # noqa: E731
+    def mean(values: list[float]) -> float:
+        return sum(values) / len(values)
+
     print(f"SUMMARY fixture=partial_overwrite region={args.region} files={args.files} "
           f"head_mean={mean(head_scores):.2f} tail_mean={mean(tail_scores):.2f} "
           f"sampled_mean={mean(combined_scores):.2f}")

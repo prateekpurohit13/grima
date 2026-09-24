@@ -25,6 +25,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 16. [Calibration Units Were Mismatched](#16-calibration-units-were-mismatched)
 17. [`ngram_rename_chain` Cannot Tell Extraction From Encryption](#17-ngram_rename_chain-cannot-tell-extraction-from-encryption)
 18. [Two Weight-Table Problems The Ablation Must Price](#18-two-weight-table-problems-the-ablation-must-price)
+19. [The Atomic-Save False Positive](#19-the-atomic-save-false-positive)
 
 ---
 
@@ -1131,3 +1132,64 @@ must be either a minimum-novelty floor — do not alert below N files of an unse
 or accepting the alert as "unknown file type, watch this". That is a product decision, not a
 tuning one, and it should be made deliberately rather than by leaving the threshold where it
 landed.
+
+---
+
+## 19. The Atomic-Save False Positive
+
+Sprint 2's benign corpus found a genuine false positive on the workload most likely to trip
+it, and fixing it took three passes because each fix exposed the next contributor.
+
+### The workload and the result
+
+A dense batch of atomic saves — write a temp file, rename it over the target — which is what
+editors, config managers and archive extractors do. Measured on a host calibrated *with* the
+workload running, as the corpus intends:
+
+| Stage | Score | Level | Signals |
+|---|---|---|---|
+| As found | 56.6 | medium | `dir_fanout; write_burst` |
+| After the baseline fix | 50.7 | medium | `delete_rate; ngram_rename_chain` |
+| After the weight fix | **45.1** | **medium** | `delete_rate; dir_fanout; entropy_deviation` |
+
+**It still alerts, at 45.1 against a 45 band.** Each fix removed a contributor; the
+combination still crosses by 0.1. Recorded as an open false positive rather than declared
+fixed.
+
+### Contributor 1: a burst measured against an arbitrary process
+
+`write_burst` normalised against `WriteRateByProc[procName]`, and under correlative
+attribution — the default, measured at **0% accuracy** — the blamed process is a guess. The
+workload was blamed on `firefox.exe`, whose 1.67 writes/s baseline made a legitimate burst
+look 5–10× over, where the host's 130.3 writes/s would not have fired at all.
+
+**Fixed:** a per-process baseline is only used when attribution is causal
+(`attribution.mode = "audit"`). Using a guess as a denominator is the bug, not the weight.
+
+### Contributor 2: Secondary signals that alert alone
+
+With the burst signal gone, `delete_rate` carried the verdict by itself. It sits at weight
+0.5, and §18 established that any weight ≥ 0.45 is solo-alertable — so it scored exactly 50
+against a 45 band, paging an operator with no corroboration.
+
+**Fixed:** `delete_rate`, `dir_fanout` and `cum_bytes_rewritten` moved to 0.4, below the
+solo-alertable line. A Secondary signal now corroborates rather than carrying a verdict.
+
+### Contributor 3: noisy-OR over-counts non-independent evidence
+
+After both fixes the score is 45.1 — three legitimate observations (`delete_rate`,
+`dir_fanout`, a mild entropy shift) combining to just cross the band.
+
+This is the residue of treating non-independent evidence as independent, which §17 identified
+as the case for deleting `ngram_rename_chain` and which applies to the fusion itself. **Not
+fixed**, and it should not be fixed by nudging the band: the question is whether a workload
+that genuinely writes, deletes and spreads across eight directories at 53 operations/s should
+alert at the *lowest* band. That is a product decision for Sprint 4 (items 4.9, 4.10).
+
+### A limitation this exposed in recalibration
+
+Merging pools distributions, so one recalibration lowers a large rate deviation sharply
+without erasing it: `write_burst` fell from 0.81 to 0.19 in one pass, and repeated passes
+converge rather than one pass settling it. The extension signal *is* fully absorbed, because
+promotion is absolute. Worth knowing before telling an operator "recalibrate once and it goes
+away".

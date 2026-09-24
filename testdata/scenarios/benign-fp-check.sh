@@ -56,15 +56,34 @@ BINARY="${GRIMA_BINARY:-$ROOT_SH/grima}"
 [ -x "$BINARY" ] || BINARY="$ROOT_SH/grima.exe"
 [ -x "$BINARY" ] || { echo "error: build grima first (make build), or set GRIMA_BINARY" >&2; exit 2; }
 
-PYTHON="${GRIMA_FP_PYTHON:-$(command -v python3 || command -v python)}" \
+# A `python3` on PATH may be a Windows Store stub that prints an install message
+# and does nothing, so each candidate has to prove it runs.
+pick_python() {
+  local candidate
+  for candidate in "$@"; do
+    [ -n "$candidate" ] || continue
+    if "$candidate" -c 'import sys' >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PYTHON="$(pick_python "${GRIMA_FP_PYTHON:-}" python3 python)" \
   || { echo "error: python is required for the verdict dump" >&2; exit 2; }
 
 PORT="${GRIMA_FP_PORT:-8794}"
 DURATION="${GRIMA_FP_DURATION:-90s}"
 WORK="${GRIMA_FP_WORK:-${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/grima-fp}/$NAME"
-DATA="$WORK/data"
+# The workload works inside a monitored tree rather than being the tree: most of
+# these scripts reset their own work directory at the start, and deleting the
+# directory the sensor is watching removes the watch, after which nothing is
+# seen and the baseline comes out empty.
+MONITOR="$WORK/monitored"
+DATA="$MONITOR/data"
 mkdir -p "$WORK"
-rm -rf "$DATA"
+rm -rf "$MONITOR"
 mkdir -p "$DATA"
 
 echo "false-positive check: $NAME"
@@ -73,7 +92,7 @@ echo "detector: $BINARY on port $PORT"
 
 cat > "$WORK/grima.toml" <<EOF
 [general]
-monitor_paths = ["$(to_host_path "$DATA")"]
+monitor_paths = ["$(to_host_path "$MONITOR")"]
 log_level = "info"
 
 [web]
@@ -103,7 +122,8 @@ run_scenario() { # $1 log file, rest: extra scenario args
 CAL_PID=$!
 
 calibration_passes=0
-while kill -0 "$CAL_PID" 2>/dev/null && [ "$calibration_passes" -lt 12 ]; do
+cal_deadline=$(( $(date +%s) + 18 ))
+while [ "$(date +%s)" -lt "$cal_deadline" ]; do
   run_scenario "$WORK/warmup.log" "$@" || true
   calibration_passes=$((calibration_passes + 1))
 done

@@ -273,10 +273,13 @@ rather than being lost between children.
 
 It is emitted as signal #14, `ngram_rename_chain` (Secondary, no baseline input): a window
 shorter than $k$ events produces no signal at all, which is not the same as a window with
-no chains. The shape is not unique to ransomware — an extractor or an atomic-save editor
-writes and renames too — so the weight is a starting point for the evaluation harness, not
-a calibrated constant. This closes the gap §9 of the sprint plan carried into Sprint 2: the
-config key is read, and the signal reaches verdicts.
+no chains. Measured on Windows with the real sensor, an atomic save over an existing file
+(`create, write, delete, rename`) produces no chain, so editors stay silent, while an
+extractor or installer (`create, write, rename`) reaches the same value as an encryptor
+(`write, rename, create`) — its cycle is a rotation of the encryptor's. Since the feature
+cannot separate extraction from encryption, it ships at a low weight (0.2) as corroboration
+for the content signals rather than as an alert on its own. This closes the gap §9 of the
+sprint plan carried into Sprint 2: the config key is read, and the signal reaches verdicts.
 
 ---
 

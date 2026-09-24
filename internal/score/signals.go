@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/prateekpurohit13/grima/internal/calibrate"
+	"github.com/prateekpurohit13/grima/internal/config"
 	"github.com/prateekpurohit13/grima/internal/fingerprint"
 )
 
@@ -35,7 +36,7 @@ func (s *Scorer) computeSignals(in Inputs, calibrated bool) []Signal {
 		if sg, ok := entropySignal(tv, b); ok {
 			out = append(out, sg)
 		}
-		if sg, ok := writeBurstSignal(tv, b, windowSeconds); ok {
+		if sg, ok := writeBurstSignal(tv, b, windowSeconds, s.trustPerProcessBaseline()); ok {
 			out = append(out, sg)
 		}
 		if sg, ok := renameBurstSignal(tv, b, windowSeconds); ok {
@@ -152,9 +153,13 @@ func magicSignal(tv fingerprint.TreeVector) (Signal, bool) {
 
 // ngramRenameChainSignal reads the fingerprint's sequence feature. An encryptor
 // overwrites a file and then renames it to a new extension, so a window whose
-// k-grams are write-then-rename chains is encryption-like; a compiler, archiver
-// or backup writes without renaming, so its share stays at zero. The measure
-// needs no baseline — it is a statement about the window's own sequence.
+// k-grams hold write-then-rename chains is encryption-like. Measured on Windows,
+// an atomic save over an existing file produces no chain at all — the sensor
+// reports the temp file's removal as a delete between the write and the rename —
+// but an extraction that renames a new file into place produces the same
+// sequence, because the two cycles are rotations of one another. That is why it
+// ships at a low weight: it corroborates the content signals rather than
+// alerting on its own.
 func ngramRenameChainSignal(tv fingerprint.TreeVector) (Signal, bool) {
 	ng := tv.NGram
 	if ng.Total < minNGramWindows || ng.RenameChains < minRenameChains {
@@ -175,9 +180,9 @@ func ngramRenameChainSignal(tv fingerprint.TreeVector) (Signal, bool) {
 	}, true
 }
 
-func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64) (Signal, bool) {
+func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64, trustPerProcess bool) (Signal, bool) {
 	rate := float64(tv.Writes) / windowSeconds
-	base, sigma, ok := rateBaseline(b, tv.ProcName)
+	base, sigma, ok := rateBaseline(b, tv.ProcName, trustPerProcess)
 	if !ok || base <= 0 {
 		return Signal{}, false
 	}
@@ -305,12 +310,25 @@ func busDropSignal(dropped uint64) (Signal, bool) {
 	}, true
 }
 
-// rateBaseline prefers the per-process baseline and falls back to the host-wide
-// write rate, because ransomware is a new process no per-process baseline
-// contains. Both are write rates: comparing a write rate against an all-event
-// rate made this signal unreachable on a host with many processes.
-func rateBaseline(b *calibrate.Baseline, procName string) (base, sigma float64, ok bool) {
-	if procName != "" {
+// trustPerProcessBaseline reports whether a blamed process can be believed
+// enough to measure it against its own baseline. Only causal attribution can
+// name the writer; correlative attribution cannot, and using its guess as a
+// denominator turns a benign burst into a deviation from an unrelated process.
+func (s *Scorer) trustPerProcessBaseline() bool {
+	return s.cfg.Attribution.Mode == config.AttributionAudit
+}
+
+// rateBaseline returns the rate a write burst is measured against.
+//
+// A per-process baseline is only meaningful when the blamed process really is
+// the writer. Under correlative attribution it is not — that mode was measured
+// at 0% accuracy — so normalizing against it compares a workload's writes to an
+// arbitrary process's rate. Measured consequence: a benign 480-save atomic-save
+// workload was blamed on firefox.exe, whose 1.67 writes/s baseline made the
+// burst look 5-10x over and produced a medium false positive, where the host
+// baseline of 130.3 writes/s would not have fired at all.
+func rateBaseline(b *calibrate.Baseline, procName string, trustPerProcess bool) (base, sigma float64, ok bool) {
+	if trustPerProcess && procName != "" {
 		if v, found := b.WriteRateByProc[procName]; found && v > 0 {
 			return v, b.WriteRate.StdDev, true
 		}

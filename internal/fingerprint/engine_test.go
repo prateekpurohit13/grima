@@ -67,6 +67,26 @@ func TestCumulativeCountersSurviveDecay(t *testing.T) {
 	}
 }
 
+// A rename emits a create for its destination carrying the whole file size, so
+// counting bytes on creates reported roughly twice what was actually written.
+// Measured against a fixture that wrote 96 MiB and was reported at ~193 MiB.
+func TestCumulativeBytesAreNotDoubleCountedOnRename(t *testing.T) {
+	e := testEngine(t, time.Minute)
+	now := time.Now()
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 7, ProcName: "crypt", Time: now})
+
+	// The write that put the bytes on disk, then the rename's destination create.
+	e.Apply(event.Event{Kind: event.KindFileWrite, PID: 7, Path: "/d/a.txt", Bytes: 4096, Time: now})
+	e.Apply(event.Event{Kind: event.KindFileRename, PID: 7, Path: "/d/a.txt", NewPath: "/d/a.txt.locked", Time: now})
+	e.Apply(event.Event{Kind: event.KindFileCreate, PID: 7, Path: "/d/a.txt.locked", Bytes: 4096, Time: now})
+
+	tv := e.Aggregate(7)
+	if tv.CumBytesRewritten != 4096 {
+		t.Fatalf("cumulative bytes = %d, want 4096: a rename must not re-count the file it moved",
+			tv.CumBytesRewritten)
+	}
+}
+
 func TestExtensionActivityIsCumulative(t *testing.T) {
 	e := testEngine(t, time.Minute)
 	now := time.Now()

@@ -13,6 +13,15 @@ import (
 	"github.com/prateekpurohit13/grima/internal/score"
 )
 
+func signalNamed(signals []score.Signal, name string) (score.Signal, bool) {
+	for _, sg := range signals {
+		if sg.Name == name {
+			return sg, true
+		}
+	}
+	return score.Signal{}, false
+}
+
 // 2.6: a workload that splits encryption across cooperating children keeps every
 // child below the threshold that would alert on it alone. The tree aggregate is
 // what turns N quiet processes into one loud actor.
@@ -98,4 +107,76 @@ func TestSplitWorkloadScoresAsOneActorAboveThreshold(t *testing.T) {
 	}
 	t.Logf("split tree: %d writes across %d processes, score %.1f, %s",
 		tree.Writes, len(tree.PIDs), verdict.Score, detail)
+}
+
+// Characterisation of what the n-gram signal fires on, using the event shapes
+// measured on this host with the real sensor (see the report's harness runs):
+//
+//	atomic save over an existing file   create, write, delete, rename
+//	extract / install / release script  create, write, rename
+//	encryptor (write in place, rename)  write, rename, create
+//
+// An atomic save is silent: replacing an existing target makes the sensor report
+// the temp file's removal as a delete between the write and the rename, so no
+// write>rename adjacency exists anywhere in the window.
+//
+// An extraction is not silent, and the reason matters: its cycle is a rotation
+// of the encryptor's cycle, so the k-grams of the two are the same multiset and
+// this feature cannot separate them. The evidence that does separate them is
+// content-derived (entropy, magic bytes, extension novelty), which is why the
+// signal is Secondary and ships at a weight that cannot alert on its own
+// (0.2 — a benign extraction reaches the low band, not the medium one).
+func TestNGramRenameChainOnAtomicSaveAndExtractionShapes(t *testing.T) {
+	cfg := config.Default() // 30s window, so 40 writes is 1.3/s
+	scorer := score.NewScorer(cfg)
+
+	measure := func(procName string, cycle []event.Kind, reps int) score.Verdict {
+		engine := fingerprint.NewEngine(cfg)
+		now := time.Now()
+		engine.Apply(event.Event{Kind: event.KindProcessStart, PID: 21, ProcName: procName, Time: now})
+		for range reps {
+			for _, kind := range cycle {
+				engine.Apply(event.Event{Kind: kind, PID: 21, Path: "/data/f.docx", Bytes: 4096, Time: now})
+			}
+		}
+		return scorer.Evaluate(score.Inputs{Tree: engine.Aggregate(21)})
+	}
+
+	atomicSave := measure("atomic-save", []event.Kind{
+		event.KindFileCreate, event.KindFileWrite, event.KindFileDelete, event.KindFileRename,
+	}, 40)
+	if sg, ok := signalNamed(atomicSave.Signals, "ngram_rename_chain"); ok {
+		t.Fatalf("an atomic save burst fired the n-gram signal: %s", sg.Detail)
+	}
+
+	extraction := measure("extractor", []event.Kind{
+		event.KindFileCreate, event.KindFileWrite, event.KindFileRename,
+	}, 40)
+	encryption := measure("encryptor", []event.Kind{
+		event.KindFileWrite, event.KindFileRename, event.KindFileCreate,
+	}, 40)
+
+	for name, v := range map[string]score.Verdict{"extraction": extraction, "encryption": encryption} {
+		sg, ok := signalNamed(v.Signals, "ngram_rename_chain")
+		if !ok {
+			t.Fatalf("%s did not fire the n-gram signal: %v", name, v.Signals)
+		}
+		if sg.Value != 1 {
+			t.Fatalf("%s fired at value %.2f, want the saturated 1", name, sg.Value)
+		}
+		t.Logf("%s: score %.1f level %v — %s", name, v.Score, v.Level, sg.Detail)
+	}
+	if extraction.Score != encryption.Score {
+		t.Fatalf("extraction scored %.1f and encryption %.1f: the shapes are rotations of one cycle, so the signal must treat them alike",
+			extraction.Score, encryption.Score)
+	}
+	// The shipped weight exists to keep this signal from alerting on its own: an
+	// extraction is a benign workload, so alone it must stay under the medium
+	// band. That is not the same as making fusion safe — measured separately, it
+	// still lifts a companion that would sit at 33 up to 47 — but raising the
+	// weight has to be a deliberate act, not a drift.
+	if medium := cfg.Scoring.LevelBands.Medium; extraction.Score >= medium {
+		t.Fatalf("a benign extraction reached %.1f with the n-gram signal alone, at or above the medium band %.0f",
+			extraction.Score, medium)
+	}
 }

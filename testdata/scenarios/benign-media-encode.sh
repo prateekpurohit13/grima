@@ -17,9 +17,23 @@ WORK="${1:-${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/grima-benign-media}"
 SECONDS_PER_CLIP="${GRIMA_MEDIA_SECONDS:-20}"
 FRAMES="${GRIMA_MEDIA_FRAMES:-24}"
 
-if [ "$(command -v ffmpeg)" = "" ]; then
-  PYTHON="${GRIMA_PYTHON:-$(command -v python3 || command -v python)}" \
-    || { echo "error: no video encoder and no python for the fallback" >&2; exit 2; }
+# A `python3` on PATH may be a Windows Store stub that prints an install message
+# and does nothing, so each candidate has to prove it runs.
+pick_python() {
+  local candidate
+  for candidate in "$@"; do
+    [ -n "$candidate" ] || continue
+    if "$candidate" -c 'import sys' >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  PYTHON="$(pick_python "${GRIMA_PYTHON:-}" python3 python)" \
+    || { echo "error: no video encoder and no working python for the fallback" >&2; exit 2; }
 fi
 
 rm -rf "$WORK"

@@ -217,6 +217,65 @@ func TestWriteBurstComparesLikeWithLike(t *testing.T) {
 		signalNames(verdict))
 }
 
+// A per-process baseline is only meaningful when the blamed process really is
+// the writer. Correlative attribution was measured at 0% accuracy, so
+// normalizing a burst against its guess compares the workload to an arbitrary
+// process. Measured consequence: a benign 480-save atomic-save workload blamed
+// on firefox.exe, whose 1.67 writes/s baseline made the burst look 5-10x over
+// and produced a medium false positive, where the host baseline of 130.3
+// writes/s would not have fired at all.
+func TestWriteBurstIgnoresPerProcessBaselineUnderCorrelativeAttribution(t *testing.T) {
+	cfg := config.Default()
+	cfg.Attribution.Mode = config.AttributionCorrelate
+
+	baseline := testBaseline()
+	baseline.WriteRate = calibrate.Dist{Mean: 130.3, StdDev: 20, N: 100}
+	baseline.WriteRateByProc = map[string]float64{"firefox.exe": 1.67}
+
+	tree := fingerprint.TreeVector{
+		Root:           1,
+		ProcName:       "firefox.exe",
+		Writes:         480,
+		WindowDuration: 27 * time.Second, // ~17.8 writes/s
+	}
+
+	verdict := NewScorer(cfg).Evaluate(Inputs{Tree: tree, Baseline: baseline})
+
+	for _, sg := range verdict.Signals {
+		if sg.Name == "write_burst" {
+			t.Fatalf("write_burst fired against an arbitrary process's baseline: %s", sg.Detail)
+		}
+	}
+}
+
+// With causal attribution the blamed process can be believed, so its own
+// baseline is the right comparison and the signal is allowed to fire.
+func TestWriteBurstUsesPerProcessBaselineUnderCausalAttribution(t *testing.T) {
+	cfg := config.Default()
+	cfg.Attribution.Mode = config.AttributionAudit
+
+	baseline := testBaseline()
+	baseline.WriteRate = calibrate.Dist{Mean: 130.3, StdDev: 20, N: 100}
+	baseline.WriteRateByProc = map[string]float64{"cryptor": 1.67}
+
+	tree := fingerprint.TreeVector{
+		Root:           1,
+		ProcName:       "cryptor",
+		Writes:         480,
+		WindowDuration: 27 * time.Second,
+	}
+
+	verdict := NewScorer(cfg).Evaluate(Inputs{Tree: tree, Baseline: baseline})
+
+	for _, sg := range verdict.Signals {
+		if sg.Name == "write_burst" {
+			return
+		}
+	}
+	t.Fatalf("write_burst did not fire against a known writer's own baseline; signals = %v",
+		signalNames(verdict))
+}
+
 func signalNames(v Verdict) []string {
 	names := make([]string, 0, len(v.Signals))
 	for _, sg := range v.Signals {

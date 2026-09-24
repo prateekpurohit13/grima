@@ -9,6 +9,17 @@
 #                 the only track that can fire. This is the crisp dual-track
 #                 demonstration: every decaying-window signal absent, the
 #                 cumulative counters climbing until they cross the band.
+#                 Each file's write is spread over 2500 ms (the remaining 2.5 s
+#                 is the pacing sleep) because correlation attribution only
+#                 considers processes seen writing in the last 2 s
+#                 (4 x attribution.max_delay). A single-shot write finishes
+#                 before any process sample lands on it, so the rename that
+#                 carries the new extension gets blamed on whichever process was
+#                 busy instead: GRIMA_RATES_QUIET_WRITE_MS=0 reproduces that, and
+#                 the same 24 writes then split across four fingerprints
+#                 (0.18 + 0.16 + 0.08 + 0.06), no fingerprint crosses the band,
+#                 and the run produces no alert even though every window signal
+#                 is absent and the evidence is complete.
 #   intermittent  `encryptor.py --rate intermittent`, which overwrites only the
 #                 first 4 KiB of each file.
 #   tail          a file whose head is untouched and whose last 4 KiB is
@@ -27,6 +38,7 @@
 #   GRIMA_RATES_WORK  work root (default $TMPDIR/grima-rates)
 #   GRIMA_RATES_PYTHON  interpreter for the fixtures
 #   GRIMA_RATES_FILES   files for the paced drip phases (default 20)
+#   GRIMA_RATES_QUIET_WRITE_MS  milliseconds to spread each quiet-drip write over
 #
 # Evidence: every phase prints its full verdict series, the check list, and the
 # path of its logs. Exits non-zero if any check fails.
@@ -58,13 +70,29 @@ BINARY="${GRIMA_BINARY:-$ROOT_SH/grima}"
 [ -x "$BINARY" ] || BINARY="$ROOT_SH/grima.exe"
 [ -x "$BINARY" ] || { echo "error: build grima first (make build), or set GRIMA_BINARY" >&2; exit 2; }
 
-PYTHON="${GRIMA_RATES_PYTHON:-$(command -v python3 || command -v python)}" \
+# A `python3` on PATH may be a Windows Store stub that prints an install message
+# and does nothing, so each candidate has to prove it runs.
+pick_python() {
+  local candidate
+  for candidate in "$@"; do
+    [ -n "$candidate" ] || continue
+    if "$candidate" -c 'import sys' >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PYTHON="$(pick_python "${GRIMA_RATES_PYTHON:-}" python3 python)" \
   || { echo "error: python is required for the fixtures" >&2; exit 2; }
 
 PORT="${GRIMA_RATES_PORT:-8794}"
 WORK="${GRIMA_RATES_WORK:-${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/grima-rates}"
 FILES="${GRIMA_RATES_FILES:-20}"
 QUIET_FILES="${GRIMA_RATES_QUIET_FILES:-24}"
+QUIET_WRITE_MS="${GRIMA_RATES_QUIET_WRITE_MS:-2500}"
+QUIET_INTERVAL="${GRIMA_RATES_QUIET_INTERVAL:-2.5}"
 PDF_FILES="${GRIMA_RATES_PDF_FILES:-40}"
 
 SCENARIOS="$ROOT_SH/testdata/scenarios"
@@ -143,7 +171,10 @@ start_detector() { # $1 phase dir, $2 duration
 # poll_verdicts records one line per verdict for every poll, so the file is both
 # the evidence and the input to the checks.
 poll_verdicts() { # $1 out file, $2 duration seconds
-  local out="$1" duration="$2" end=$(( $(date +%s) + duration ))
+  local out="$1"
+  local duration="$2"
+  local end
+  end=$(( $(date +%s) + duration ))
   : > "$out"
   while [ "$(date +%s)" -lt "$end" ]; do
     curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/verdicts" 2>/dev/null \
@@ -171,14 +202,20 @@ PY
 
 # check_series prints the series and asserts what the phase is supposed to show.
 # $1 file, $2 phase label, $3 present signals (csv or -), $4 absent signals (csv
-# or -), $5 extra check: alert | early-below-medium
+# or -), $5 extra check: alert | early-below-medium, $6 signals of which at
+# least one must be present (csv or -, default -)
 check_series() {
-  local file="$1" label="$2" present="$3" absent="$4" extra="$5"
+  local file="$1"
+  local label="$2"
+  local present="$3"
+  local absent="$4"
+  local extra="$5"
+  local any="${6:--}"
   echo
   echo "--- $label: verdict series ---"
   cat "$file"
   echo "--- $label: checks ---"
-  "$PYTHON" -c "$CHECK_PY" "$file" "$label" "$present" "$absent" "$extra"
+  "$PYTHON" -c "$CHECK_PY" "$file" "$label" "$present" "$absent" "$extra" "$any"
   local rc=$?
   [ "$rc" -eq 0 ] || failures=$((failures + 1))
 }
@@ -188,6 +225,7 @@ import re
 import sys
 
 path, label, present, absent, extra = sys.argv[1:6]
+any_of = sys.argv[6] if len(sys.argv) > 6 else "-"
 levels = ["info", "low", "medium", "high", "critical"]
 groups = []
 seen = set()
@@ -231,6 +269,11 @@ else:
     for name in [n for n in present.split(",") if n and n != "-"]:
         shown = " (max value %.3f)" % worst[name] if name in worst else ""
         check(name in seen, "signal %s was present%s" % (name, shown))
+    wanted = [n for n in any_of.split(",") if n and n != "-"]
+    if wanted:
+        hit = [n for n in wanted if n in seen]
+        check(bool(hit), "at least one cumulative signal fired (%s)"
+              % ("; ".join("%s=max %.3f" % (n, worst.get(n, 0.0)) for n in hit) or "none"))
     for name in [n for n in absent.split(",") if n and n != "-"]:
         check(name not in seen, "signal %s was absent from every verdict" % name)
     stamps = []
@@ -283,7 +326,9 @@ warmup_quiet() { # $1 data dir, $2 log
 # --- phases ------------------------------------------------------------------
 
 phase_drip() {
-  local dir="$WORK/drip" data="$dir/data" i
+  local dir="$WORK/drip"
+  local data="$dir/data"
+  local i
   rm -rf "$dir"
   mkdir -p "$data"
   for i in $(seq 1 "$FILES"); do
@@ -309,14 +354,16 @@ phase_drip() {
   DETECTOR_PID=""
 
   echo "detector alerts: $(grep -c 'ransomware risk detected' "$dir/grima.log")"
-  check_series "$dir/verdicts.txt" "drip" "unknown_extension_activity" "write_burst" "alert"
+  check_series "$dir/verdicts.txt" "drip" "-" "write_burst" "alert" \
+    "unknown_extension_activity,cum_bytes_rewritten"
   grep -qE 'level=(high|critical)' "$dir/grima.log" && pass "detector logged an alert for drip" \
     || fail "no high/critical alert logged for drip"
   echo "logs: $dir"
 }
 
 phase_quiet_drip() {
-  local dir="$WORK/quiet-drip" data="$dir/data"
+  local dir="$WORK/quiet-drip"
+  local data="$dir/data"
   rm -rf "$dir"
   mkdir -p "$data"
 
@@ -334,7 +381,8 @@ phase_quiet_drip() {
   sleep 5
 
   "$PYTHON" "$(to_host_path "$QUIET_DRIP_PY")" --path "$(to_host_path "$data")" \
-    --files "$QUIET_FILES" --interval 5 --seed 7 > "$dir/drip.log" 2>&1
+    --files "$QUIET_FILES" --interval "$QUIET_INTERVAL" --write-ms "$QUIET_WRITE_MS" \
+    --seed 7 > "$dir/drip.log" 2>&1
   cat "$dir/drip.log"
 
   wait "$POLLER_PID" 2>/dev/null
@@ -369,8 +417,34 @@ else:
 PY
 }
 
+# sample_z turns the fixture's measured head and head+tail entropies into the
+# per-sample deviation the entropy signal would see, so "the tail sample is what
+# caught it" is a number rather than an assertion.
+sample_z() { # $1 baseline json, $2 extension, $3 fixture log
+  local head sampled
+  head="$(grep -o 'head_mean=[0-9.]*' "$3" | cut -d= -f2)"
+  sampled="$(grep -o 'sampled_mean=[0-9.]*' "$3" | cut -d= -f2)"
+  if [ -z "$head" ] || [ -z "$sampled" ]; then
+    fail "fixture log does not report head/sampled entropy"
+    return 1
+  fi
+  "$PYTHON" - "$1" "$2" "$head" "$sampled" <<'PY'
+import json, sys
+bl = json.load(open(sys.argv[1]))
+ext, head, sampled = sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+d = bl["entropy_by_ext"][ext]
+sigma = max(d["std_dev"], bl.get("sigma_floor", 0.0))
+for label, value in (("head sample alone", head), ("head+tail sample", sampled)):
+    z = (value - d["mean"]) / sigma if sigma else 0.0
+    print("%s: entropy %.2f vs baseline %.3f sigma %.3f -> z=%.2f, signal value %.3f"
+          % (label, value, d["mean"], sigma, z, max(0.0, min(1.0, z / 6)) if z > 0 else 0.0))
+PY
+}
+
 phase_intermittent() {
-  local dir="$WORK/intermittent" data="$dir/data" i
+  local dir="$WORK/intermittent"
+  local data="$dir/data"
+  local i
   rm -rf "$dir"
   mkdir -p "$data"
   for i in $(seq 1 "$PDF_FILES"); do
@@ -406,7 +480,8 @@ phase_intermittent() {
 }
 
 phase_tail() {
-  local dir="$WORK/tail" data="$dir/data"
+  local dir="$WORK/tail"
+  local data="$dir/data"
   rm -rf "$dir"
   mkdir -p "$data"
   write_plain_pdf "$data/plain.pdf" 0 0
@@ -424,6 +499,7 @@ phase_tail() {
   "$PYTHON" "$(to_host_path "$HEAD_TAIL_PY")" --path "$(to_host_path "$data")" \
     --region tail --files 5 --size-bytes 65536 --extension .pdf --seed 3 > "$dir/fixture.log" 2>&1
   cat "$dir/fixture.log"
+  sample_z "$dir/baseline.json" ".pdf" "$dir/fixture.log"
 
   wait "$POLLER_PID" 2>/dev/null
   POLLER_PID=""

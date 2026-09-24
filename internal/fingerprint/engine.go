@@ -60,9 +60,18 @@ func (e *Engine) Apply(ev event.Event) {
 	})
 
 	switch ev.Kind {
-	case event.KindFileWrite, event.KindFileCreate:
+	case event.KindFileWrite:
 		p.cumFilesRewritten++
 		p.cumBytesRewritten += ev.Bytes
+		if ext := ev.Extension(); ext != "" {
+			p.extActivity[ext]++
+		}
+	case event.KindFileCreate:
+		// A create reports the file's whole size, and a rename emits one for its
+		// destination, so adding bytes here counts every renamed file twice —
+		// measured at roughly 2x the bytes actually written. A create is still
+		// activity; it is just not bytes written.
+		p.cumFilesRewritten++
 		if ext := ev.Extension(); ext != "" {
 			p.extActivity[ext]++
 		}

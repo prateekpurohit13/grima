@@ -27,6 +27,7 @@ start="$(date +%s)"
 files=0
 bytes=0
 renames=0
+renames_failed=0
 round=0
 
 for d in $(seq 1 "$DIRS"); do
@@ -49,10 +50,20 @@ for d in $(seq 1 "$DIRS"); do
     } > "$tmp"
     files=$((files + 1))
     bytes=$((bytes + $(wc -c < "$tmp")))
-    mv -f "$tmp" "$target"
-    renames=$((renames + 1))
+    # A failed rename is reported, not hidden: it means something held the
+    # temporary file, and for an atomic-save workload that is a finding in its
+    # own right rather than a workload detail.
+    if mv -f "$tmp" "$target" 2>> "$WORK/rename-errors.log"; then
+      renames=$((renames + 1))
+    else
+      renames_failed=$((renames_failed + 1))
+    fi
   done
 done
 
 elapsed=$(( $(date +%s) - start ))
-echo "SUMMARY scenario=atomic_save files_written=$files bytes_written=$bytes renames=$renames elapsed_s=$elapsed"
+echo "SUMMARY scenario=atomic_save files_written=$files bytes_written=$bytes renames=$renames renames_failed=$renames_failed elapsed_s=$elapsed"
+if [ "$renames_failed" -gt 0 ]; then
+  echo "note: $renames_failed rename(s) failed while something held the temporary file"
+  echo "      first errors in $WORK/rename-errors.log"
+fi

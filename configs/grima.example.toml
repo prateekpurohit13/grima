@@ -107,22 +107,25 @@ name = "rename_burst"
 weight = 0.8
 # The fraction of the window's event-kind n-grams that hold a write followed by
 # a rename, the sequence an encryptor produces when it writes a file and renames
-# it to a new extension. k is window.ngram_length.
+# it to a new extension. k is window.ngram_length. Weighted low on purpose: an
+# extractor or installer that renames a new file into place produces the same
+# sequence — the two cycles are rotations of each other — so this corroborates
+# the content signals rather than alerting on its own.
 [[scoring.weights]]
 name = "ngram_rename_chain"
-weight = 0.5
+weight = 0.2
 [[scoring.weights]]
 name = "unknown_extension_activity"
 weight = 1.0
 [[scoring.weights]]
 name = "delete_rate"
-weight = 0.5
+weight = 0.4
 [[scoring.weights]]
 name = "dir_fanout"
-weight = 0.5
+weight = 0.4
 [[scoring.weights]]
 name = "cum_bytes_rewritten"
-weight = 0.5
+weight = 0.4
 [[scoring.weights]]
 name = "bus_drops"
 weight = 0.2

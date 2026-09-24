@@ -171,11 +171,16 @@ var DefaultSignalWeights = []Weight{
 	{Name: "write_burst", Weight: 1.0},
 	{Name: "write_rate_absolute", Weight: 1.0},
 	{Name: "rename_burst", Weight: 0.8},
-	{Name: "ngram_rename_chain", Weight: 0.5},
+	{Name: "ngram_rename_chain", Weight: 0.2},
 	{Name: "unknown_extension_activity", Weight: 1.0},
-	{Name: "delete_rate", Weight: 0.5},
-	{Name: "dir_fanout", Weight: 0.5},
-	{Name: "cum_bytes_rewritten", Weight: 0.5},
+	// Secondary signals corroborate; none may carry a verdict alone. A signal is
+	// solo-alertable iff weight >= the medium band (45), so these sit at 0.4
+	// rather than 0.5. At 0.5 each scored exactly 50 and paged an operator with
+	// no second opinion — measured on a benign atomic-save workload, which
+	// alerted at medium on delete_rate alone.
+	{Name: "delete_rate", Weight: 0.4},
+	{Name: "dir_fanout", Weight: 0.4},
+	{Name: "cum_bytes_rewritten", Weight: 0.4},
 	{Name: "static_reputation", Weight: 0.6},
 	{Name: "bus_drops", Weight: 0.2},
 }
