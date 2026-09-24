@@ -24,7 +24,7 @@ import (
 
 // Version is the baseline schema version. A baseline whose version does not
 // match is ignored rather than fatal.
-const Version = 1
+const Version = 2
 
 // Dist is a measured distribution.
 type Dist struct {
@@ -43,9 +43,19 @@ type Baseline struct {
 	SigmaFloor      float64            `json:"sigma_floor"`
 	EntropyByExt    map[string]Dist    `json:"entropy_by_ext"`
 	WriteRateByProc map[string]float64 `json:"write_rate_by_proc"`
-	HostEventRate   Dist               `json:"host_event_rate"`
-	DirFanout       Dist               `json:"dir_fanout"`
-	KnownExt        []string           `json:"known_ext"`
+
+	// Per-second rates for file events, split by kind so the burst signals
+	// compare like with like. An earlier version kept one all-event rate and
+	// compared subset rates against it; on a host with 400 processes the
+	// baseline was dominated by process events, so write_burst and its siblings
+	// could never reach their threshold.
+	WriteRate     Dist `json:"write_rate"`
+	RenameRate    Dist `json:"rename_rate"`
+	DeleteRate    Dist `json:"delete_rate"`
+	FileEventRate Dist `json:"file_event_rate"`
+
+	DirFanout Dist     `json:"dir_fanout"`
+	KnownExt  []string `json:"known_ext"`
 }
 
 // Ready reports whether the baseline has enough samples for deviation signals to
@@ -88,6 +98,14 @@ func (b *Baseline) KnowsExt(ext string) bool {
 	return false
 }
 
+// secondCounts is one second of file events, split by kind.
+type secondCounts struct {
+	file   int
+	write  int
+	rename int
+	delete int
+}
+
 // Observations accumulates the measurements a baseline is assembled from.
 // Capture and Recalibrate both measure through it, so a recalibration window and
 // a first capture reduce to comparable numbers.
@@ -95,7 +113,7 @@ type Observations struct {
 	entropyByExt map[string][]float64
 	writeCounts  map[string]int
 	dirSets      map[string]map[string]struct{}
-	perSecond    map[int64]int
+	perSecond    map[int64]secondCounts
 	extSeen      map[string]struct{}
 }
 
@@ -105,7 +123,7 @@ func NewObservations() *Observations {
 		entropyByExt: make(map[string][]float64),
 		writeCounts:  make(map[string]int),
 		dirSets:      make(map[string]map[string]struct{}),
-		perSecond:    make(map[int64]int),
+		perSecond:    make(map[int64]secondCounts),
 		extSeen:      make(map[string]struct{}),
 	}
 }
@@ -116,7 +134,24 @@ func (o *Observations) Observe(ev event.Event) {
 		*o = *NewObservations()
 	}
 
-	o.perSecond[ev.Time.Unix()]++
+	// Process events are deliberately excluded: these rates are the baseline
+	// for file-derived burst signals, and a busy host emits far more process
+	// events than file events.
+	if ev.Kind.IsFile() {
+		second := ev.Time.Unix()
+		counts := o.perSecond[second]
+		counts.file++
+		switch ev.Kind {
+		case event.KindFileWrite, event.KindFileCreate:
+			counts.write++
+		case event.KindFileRename:
+			counts.rename++
+		case event.KindFileDelete:
+			counts.delete++
+		}
+		o.perSecond[second] = counts
+	}
+
 	if ext := ev.Extension(); ext != "" {
 		o.extSeen[ext] = struct{}{}
 	}
@@ -184,10 +219,19 @@ func (o *Observations) Baseline(cfg config.Config, elapsed time.Duration) *Basel
 	bl.DirFanout = distOf(fanouts)
 
 	rates := make([]float64, 0, len(o.perSecond))
-	for _, n := range o.perSecond {
-		rates = append(rates, float64(n))
+	writes := make([]float64, 0, len(o.perSecond))
+	renames := make([]float64, 0, len(o.perSecond))
+	deletes := make([]float64, 0, len(o.perSecond))
+	for _, counts := range o.perSecond {
+		rates = append(rates, float64(counts.file))
+		writes = append(writes, float64(counts.write))
+		renames = append(renames, float64(counts.rename))
+		deletes = append(deletes, float64(counts.delete))
 	}
-	bl.HostEventRate = distOf(rates)
+	bl.FileEventRate = distOf(rates)
+	bl.WriteRate = distOf(writes)
+	bl.RenameRate = distOf(renames)
+	bl.DeleteRate = distOf(deletes)
 
 	known := make(map[string]struct{}, len(o.extSeen))
 	for ext := range o.extSeen {
@@ -325,7 +369,10 @@ func (b *Baseline) Merge(fresh *Baseline) (int, error) {
 	}
 	b.WarmupSeconds = total
 
-	b.HostEventRate = poolDist(b.HostEventRate, fresh.HostEventRate)
+	b.FileEventRate = poolDist(b.FileEventRate, fresh.FileEventRate)
+	b.WriteRate = poolDist(b.WriteRate, fresh.WriteRate)
+	b.RenameRate = poolDist(b.RenameRate, fresh.RenameRate)
+	b.DeleteRate = poolDist(b.DeleteRate, fresh.DeleteRate)
 	b.DirFanout = poolDist(b.DirFanout, fresh.DirFanout)
 
 	known := make(map[string]struct{}, len(b.KnownExt))

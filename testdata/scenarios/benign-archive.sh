@@ -11,7 +11,7 @@
 # Prints one SUMMARY line at the end: files, bytes and elapsed seconds.
 set -uo pipefail
 
-WORK="${1:-${TMPDIR:-/tmp}/grima-benign-archive}"
+WORK="${1:-${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/grima-benign-archive}"
 DIRS="${GRIMA_ARCHIVE_DIRS:-12}"
 FILES_PER_DIR="${GRIMA_ARCHIVE_FILES:-25}"
 ROUNDS="${GRIMA_ARCHIVE_ROUNDS:-3}"

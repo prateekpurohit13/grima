@@ -22,6 +22,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 13. [Detection No Longer Depends On Attribution](#13-detection-no-longer-depends-on-attribution)
 14. [Causal Attribution: What Landed](#14-causal-attribution-what-landed)
 15. [Fusion Was Not Monotonic](#15-fusion-was-not-monotonic)
+16. [Calibration Units Were Mismatched](#16-calibration-units-were-mismatched)
 
 ---
 
@@ -865,3 +866,66 @@ Two runs of one scenario disagreed by 44 points, and the disagreement was **envi
 whether the detector read a file before or after it was renamed. That is a reminder for
 Sprint 4: TTD and detection-rate numbers taken from a single run are not trustworthy, and the
 harness has to report variance across rounds rather than one figure.
+
+---
+
+## 16. Calibration Units Were Mismatched
+
+Sprint 2 item 2.4 verified calibration end to end, and in doing so surfaced a bug that made
+three signals unreachable on a real machine.
+
+### The bug
+
+`Observations.Observe` counted **every** bus event into one per-second series:
+
+```go
+o.perSecond[ev.Time.Unix()]++
+```
+
+`HostEventRate` was built from that series, and three signals compared their own subset rate
+against it:
+
+| Signal | Compared | Against |
+|---|---|---|
+| `write_burst` | writes/s | all events/s |
+| `rename_burst` | renames/s | all events/s |
+| `delete_rate` | deletes/s | all events/s |
+
+On the test host — 404 processes, `procwatch` at 500 ms — the baseline measured **92.5
+events/s**, dominated by process lifecycle events. A 71-file encryption burst over the 30 s
+decay window is **2.4 writes/s**. The ratio is 0.03, so `write_burst` could never reach its
+threshold. It was not weak; it was dead.
+
+This also explains an inconsistency from Sprint 1: `write_burst` appeared in the CI verdict
+but never fired on a real desktop. CI calibrates against a quiet runner, so its all-event
+baseline was small enough for the ratio to work by accident.
+
+### The fix
+
+Rates are now measured per kind, and count **file events only**:
+
+```go
+type Baseline struct {
+    WriteRate     Dist  // writes per second
+    RenameRate    Dist
+    DeleteRate    Dist
+    FileEventRate Dist  // all file events, for context
+    ...
+}
+```
+
+Each signal compares against its own kind, and `rateBaseline`'s fallback uses `WriteRate`
+rather than the all-event rate. Baseline schema version bumped to 2; a v1 baseline is ignored
+and the detector runs uncalibrated until re-captured, which is the documented behaviour for a
+version mismatch.
+
+`TestWriteBurstComparesLikeWithLike` pins it: a 65-write burst over 30 s against a 0.2/s write
+baseline must fire, and the fixture also carries a realistic 92.5/s `FileEventRate` so the
+test fails if the signal ever compares against it again.
+
+### The general rule
+
+**A subset rate must never be compared against a superset baseline.** This was not a typo —
+it was a units error that survived because no test exercised the signals against a baseline
+measured on a busy host. Worth remembering for Sprint 4: a signal is not validated by firing
+in a quiet test harness.

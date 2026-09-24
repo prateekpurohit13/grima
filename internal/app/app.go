@@ -24,8 +24,9 @@ import (
 
 // Options are the runtime knobs that come from the command line.
 type Options struct {
-	Duration  time.Duration
-	Calibrate bool
+	Duration    time.Duration
+	Calibrate   bool
+	Recalibrate bool
 }
 
 const sensorBuffer = 4096
@@ -67,6 +68,9 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 
 	if opts.Calibrate {
 		return runCalibration(ctx, cfg, events, log)
+	}
+	if opts.Recalibrate {
+		return runRecalibration(ctx, cfg, events, log)
 	}
 
 	baseline, err := calibrate.Load(cfg.Calibration.BaselinePath)
@@ -178,6 +182,35 @@ func runCalibration(ctx context.Context, cfg config.Config, events *bus.Bus, log
 		"path", cfg.Calibration.BaselinePath,
 		"extensions", len(baseline.EntropyByExt),
 		"processes", len(baseline.WriteRateByProc),
+	)
+	return nil
+}
+
+// runRecalibration folds a fresh observation window into the existing baseline,
+// so a workload the operator has confirmed as benign stops alerting.
+func runRecalibration(ctx context.Context, cfg config.Config, events *bus.Bus, log *slog.Logger) error {
+	existing, err := calibrate.Load(cfg.Calibration.BaselinePath)
+	if err != nil {
+		return fmt.Errorf("load baseline: %w", err)
+	}
+	if existing == nil {
+		return fmt.Errorf("no usable baseline at %s; run --calibrate first", cfg.Calibration.BaselinePath)
+	}
+
+	log.Info("recalibrating host baseline", "warmup", cfg.Calibration.Warmup.Std().String())
+
+	merged, err := calibrate.Recalibrate(ctx, cfg, events, existing)
+	if err != nil {
+		return fmt.Errorf("recalibrate: %w", err)
+	}
+	if err := merged.Save(cfg.Calibration.BaselinePath); err != nil {
+		return fmt.Errorf("save baseline: %w", err)
+	}
+
+	log.Info("baseline recalibrated",
+		"path", cfg.Calibration.BaselinePath,
+		"extensions", len(merged.EntropyByExt),
+		"processes", len(merged.WriteRateByProc),
 	)
 	return nil
 }

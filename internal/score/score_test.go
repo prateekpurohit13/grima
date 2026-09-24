@@ -21,7 +21,10 @@ func testBaseline() *calibrate.Baseline {
 			".docx": {Mean: 4.0, StdDev: 0.5, N: 100},
 		},
 		WriteRateByProc: map[string]float64{},
-		HostEventRate:   calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
+		WriteRate:       calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
+		RenameRate:      calibrate.Dist{Mean: 2, StdDev: 1, N: 100},
+		DeleteRate:      calibrate.Dist{Mean: 2, StdDev: 1, N: 100},
+		FileEventRate:   calibrate.Dist{Mean: 12, StdDev: 2, N: 100},
 		DirFanout:       calibrate.Dist{Mean: 2, StdDev: 1, N: 100},
 		KnownExt:        []string{".docx", ".txt"},
 	}
@@ -177,6 +180,49 @@ func TestKnowsExtTreatsUnknownAsUnknown(t *testing.T) {
 	if !baseline.KnowsExt("") {
 		t.Fatal("an empty extension should not be reported as unknown")
 	}
+}
+
+// The burst signals compare a per-kind rate against the same per-kind baseline.
+//
+// An earlier baseline kept a single all-event rate, and on a busy host that was
+// dominated by process events — 92.5/s measured with 404 processes. A 65-file
+// burst over a 30s window is 2.2 writes/s, so against that baseline the ratio
+// was 0.02 and write_burst could never fire. This test gives the baseline a
+// realistic all-event rate as well, so it fails if the signal ever goes back to
+// comparing against it.
+func TestWriteBurstComparesLikeWithLike(t *testing.T) {
+	baseline := testBaseline()
+	baseline.WriteRate = calibrate.Dist{Mean: 0.2, StdDev: 0.1, N: 100}
+	baseline.FileEventRate = calibrate.Dist{Mean: 92.5, StdDev: 119.45, N: 10}
+
+	scorer := NewScorer(config.Default())
+	tree := fingerprint.TreeVector{
+		Root:           1,
+		ProcName:       "cryptor",
+		Writes:         65,
+		WindowDuration: 30 * time.Second,
+	}
+
+	verdict := scorer.Evaluate(Inputs{Tree: tree, Baseline: baseline})
+
+	for _, sg := range verdict.Signals {
+		if sg.Name == "write_burst" {
+			if sg.Detail == "" {
+				t.Fatal("write_burst fired with no detail")
+			}
+			return
+		}
+	}
+	t.Fatalf("write_burst did not fire for 2.2 writes/s against a 0.2/s baseline; signals = %v",
+		signalNames(verdict))
+}
+
+func signalNames(v Verdict) []string {
+	names := make([]string, 0, len(v.Signals))
+	for _, sg := range v.Signals {
+		names = append(names, sg.Name)
+	}
+	return names
 }
 
 // Adding evidence must never lower the score.

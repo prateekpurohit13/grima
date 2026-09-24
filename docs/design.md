@@ -234,10 +234,10 @@ type Signal struct {
 |---|---|---|---|---|
 | 1 | `entropy_deviation` | Primary | `EntropyByExt[ext]` | Implemented |
 | 2 | `magic_mismatch` | Primary | none | Implemented |
-| 3 | `write_burst` | Primary | `WriteRateByProc[name]`, falling back to `HostEventRate` | Implemented |
-| 4 | `rename_burst` | Primary | `HostEventRate` | Implemented |
+| 3 | `write_burst` | Primary | `WriteRateByProc[name]`, falling back to `WriteRate` | Implemented |
+| 4 | `rename_burst` | Primary | `RenameRate` | Implemented |
 | 5 | `unknown_extension_activity` | Primary | `KnownExt` | Implemented |
-| 6 | `delete_rate` | Secondary | `HostEventRate` | Implemented |
+| 6 | `delete_rate` | Secondary | `DeleteRate` | Implemented |
 | 7 | `dir_fanout` | Secondary | `DirFanout` | Implemented |
 | 8 | `cum_bytes_rewritten` | Secondary | none | Implemented |
 | 9 | `write_rate_absolute` | Primary | none — uncalibrated fallback only | Implemented |
@@ -266,6 +266,12 @@ type Signal struct {
   (`scoring.absolute_write_rate`, default 20 writes/s) and is superseded by
   `write_burst` the moment a baseline exists.
 - `Detail` strings must state the measured value and the comparison, never just a score.
+- **Rates compare like with like.** Each burst signal is measured against a baseline of the
+  same kind — writes against `WriteRate`, renames against `RenameRate` — and the baselines
+  count **file events only**. An earlier version kept one all-event rate; on a host with 404
+  processes that was dominated by process events (92.5/s measured), so a 65-file burst at
+  2.2 writes/s could never reach its threshold and `write_burst` was unreachable on a real
+  machine. A subset rate must never be compared against a superset baseline.
 
 ### Why `unknown_extension_activity` rather than a rename signal
 
@@ -401,14 +407,27 @@ type Baseline struct {
     Version         int
     Host            string
     CapturedAt      time.Time
-    WarmupDuration  time.Duration
+    WarmupSeconds   float64
+    MinSamples      int
+    SigmaFloor      float64
     EntropyByExt    map[string]Dist
     WriteRateByProc map[string]float64
-    HostEventRate   Dist
-    DirFanout       Dist
+
+    // Per-second rates for file events, split by kind so each burst signal
+    // compares like with like. Process events are excluded: they outnumber file
+    // events on a busy host and would mask every file-derived burst.
+    WriteRate     Dist
+    RenameRate    Dist
+    DeleteRate    Dist
+    FileEventRate Dist
+
+    DirFanout Dist
+    KnownExt  []string
 }
 
 func Capture(ctx context.Context, cfg config.Config, bus *bus.Bus) (*Baseline, error)
+func Recalibrate(ctx context.Context, cfg config.Config, bus *bus.Bus, base *Baseline) (*Baseline, error)
+func (b *Baseline) Merge(fresh *Baseline) (int, error)
 func Load(path string) (*Baseline, error)
 func (b *Baseline) Save(path string) error
 func (b *Baseline) Ready() bool
@@ -422,10 +441,24 @@ func (b *Baseline) Ready() bool
   (`N >= calibration.min_samples`). Before that, GRIMA runs in uncalibrated mode.
 - `StdDev` of `0` is replaced with a floor (`calibration.entropy_sigma_floor`, default
   `0.05`) to avoid division by zero on extensions that are always identical.
-- Persisted as JSON at `calibration.baseline_path`. Version field allows schema
-  migration; an unreadable or version-mismatched baseline is ignored, not fatal.
-- Recalibration merges confirmed-benign observations so operator-confirmed workloads
-  stop alerting. This is the feedback edge in the architecture diagram.
+- Persisted as JSON at `calibration.baseline_path`. **Schema version 2.** A version
+  mismatch is ignored rather than fatal, so a v1 baseline captured before the per-kind
+  rates existed puts the detector in uncalibrated mode and is re-captured by running
+  `--calibrate`.
+- `Recalibrate` observes a fresh window, merges it into an existing baseline with
+  `Merge`, and returns the result. Reachable from the command line as `--recalibrate`;
+  the detector exits after saving. This is the feedback edge in the architecture diagram.
+
+### Known limitation: recalibration does not fix `dir_fanout`
+
+Recalibration promotes observed extensions and re-averages per-process write rates, but a
+workload that touches an order of magnitude more directories than any other process on the
+host still trips `dir_fanout` (Secondary, weight 0.5) against the pooled host mean. Measured
+at 23.3 — below the 45 medium threshold on the test host's baseline, so it does not alert
+today, but the margin is thin and a more scattered workload would cross it.
+
+The fix is per-process directory-fanout profiles rather than a single host distribution.
+That is Sprint 4 work, and it should be measured before `dir_fanout` is relied on.
 
 ---
 

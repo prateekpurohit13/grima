@@ -116,6 +116,24 @@ banner, and `/healthz` must report `"calibration_ready": true`.
 
 **Do not commit the baseline.** It is host-specific and `.gitignore` excludes it.
 
+### Recalibrating
+
+When a legitimate workload keeps alerting, fold a window of it into the existing baseline
+rather than re-capturing from scratch — re-capturing discards everything learned:
+
+```sh
+# Confirm the workload is benign, then let it run during the warm-up
+./grima --config configs/grima.example.toml --recalibrate
+```
+
+It loads the current baseline, observes for `calibration.warmup`, merges the new
+observations, saves, and exits. Running it with no baseline present is an error, not a
+silent capture — run `--calibrate` first.
+
+**Recalibration does not fix everything.** It promotes observed extensions and re-averages
+per-process write rates, but a workload touching far more directories than any other process
+still moves `dir_fanout` against the pooled host mean. See `docs/design.md` §7.
+
 ---
 
 ## 4. Run a detection scenario

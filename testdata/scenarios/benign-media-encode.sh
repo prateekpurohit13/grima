@@ -13,9 +13,9 @@
 # path ran (ffmpeg or fallback).
 set -uo pipefail
 
-WORK="${1:-${TMPDIR:-/tmp}/grima-benign-media}"
+WORK="${1:-${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/grima-benign-media}"
 SECONDS_PER_CLIP="${GRIMA_MEDIA_SECONDS:-20}"
-FRAMES="${GRIMA_MEDIA_FRAMES:-6}"
+FRAMES="${GRIMA_MEDIA_FRAMES:-24}"
 
 if [ "$(command -v ffmpeg)" = "" ]; then
   PYTHON="${GRIMA_PYTHON:-$(command -v python3 || command -v python)}" \

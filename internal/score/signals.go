@@ -196,11 +196,11 @@ func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSe
 }
 
 func renameBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64) (Signal, bool) {
-	if b.HostEventRate.Mean <= 0 {
+	if b.RenameRate.Mean <= 0 {
 		return Signal{}, false
 	}
 	rate := float64(tv.Renames) / windowSeconds
-	base := b.HostEventRate.Mean
+	base := b.RenameRate.Mean
 	excess := rate / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
@@ -237,11 +237,11 @@ func unknownExtensionSignal(tv fingerprint.TreeVector, b *calibrate.Baseline) (S
 }
 
 func deleteRateSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64) (Signal, bool) {
-	if b.HostEventRate.Mean <= 0 {
+	if b.DeleteRate.Mean <= 0 {
 		return Signal{}, false
 	}
 	rate := float64(tv.Deletes) / windowSeconds
-	base := b.HostEventRate.Mean
+	base := b.DeleteRate.Mean
 	excess := rate / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
@@ -306,15 +306,17 @@ func busDropSignal(dropped uint64) (Signal, bool) {
 }
 
 // rateBaseline prefers the per-process baseline and falls back to the host-wide
-// rate, because ransomware is a new process no per-process baseline contains.
+// write rate, because ransomware is a new process no per-process baseline
+// contains. Both are write rates: comparing a write rate against an all-event
+// rate made this signal unreachable on a host with many processes.
 func rateBaseline(b *calibrate.Baseline, procName string) (base, sigma float64, ok bool) {
 	if procName != "" {
 		if v, found := b.WriteRateByProc[procName]; found && v > 0 {
-			return v, b.HostEventRate.StdDev, true
+			return v, b.WriteRate.StdDev, true
 		}
 	}
-	if b.HostEventRate.Mean > 0 {
-		return b.HostEventRate.Mean, b.HostEventRate.StdDev, true
+	if b.WriteRate.Mean > 0 {
+		return b.WriteRate.Mean, b.WriteRate.StdDev, true
 	}
 	return 0, 0, false
 }

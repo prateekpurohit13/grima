@@ -11,7 +11,7 @@
 # Prints one SUMMARY line at the end: files, bytes and elapsed seconds.
 set -uo pipefail
 
-WORK="${1:-${TMPDIR:-/tmp}/grima-benign-compile}"
+WORK="${1:-${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/grima-benign-compile}"
 UNITS="${GRIMA_COMPILE_UNITS:-40}"
 ROUNDS="${GRIMA_COMPILE_ROUNDS:-3}"
 
@@ -22,8 +22,12 @@ for candidate in cc gcc clang; do
     break
   fi
 done
-if [ -z "$CC" ]; then
-  echo "error: no C compiler (cc, gcc, clang) on PATH" >&2
+GO=""
+if [ -z "$CC" ] && command -v go >/dev/null 2>&1; then
+  GO=go
+fi
+if [ -z "$CC" ] && [ -z "$GO" ]; then
+  echo "error: no compiler on PATH (cc, gcc, clang, go)" >&2
   exit 2
 fi
 
@@ -31,6 +35,63 @@ SRC="$WORK/src"
 OUT="$WORK/out"
 rm -rf "$WORK"
 mkdir -p "$SRC" "$OUT"
+
+if [ -z "$CC" ]; then
+  # No C toolchain: build a generated Go program instead, with a private build
+  # cache inside the work directory so the compiler's own I/O is in the corpus.
+  echo "compile workload: $ROUNDS rounds with $GO (no C compiler on PATH)"
+  echo "work directory: $WORK"
+  CACHE="$WORK/cache"
+  mkdir -p "$CACHE" "$WORK/module"
+  cat > "$WORK/module/go.mod" <<'EOF'
+module benignfixture
+
+go 1.26
+EOF
+  cat > "$WORK/module/main.go" <<'EOF'
+package main
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+func main() {
+	sum := sha256.Sum256([]byte(strings.Repeat("benign", 64)))
+	doc := map[string]any{"digest": fmt.Sprintf("%x", sum), "at": time.Now().Format(time.RFC3339)}
+	out, _ := json.Marshal(doc)
+	_ = http.StatusOK
+	_ = tar.TypeReg
+	_ = gzip.BestCompression
+	fmt.Println(os.Args[0], string(out)[:16])
+}
+EOF
+  start="$(date +%s)"
+  files=0
+  bytes=0
+  export GOCACHE="$CACHE"
+  export GOFLAGS=-mod=mod
+  for round in $(seq 1 "$ROUNDS"); do
+    ( cd "$WORK/module" && "$GO" build -o "$OUT/app.$round" . ) || exit 1
+    files=$((files + 1))
+    bytes=$((bytes + $(wc -c < "$OUT/app.$round")))
+    echo "round $round/$ROUNDS: $OUT/app.$round"
+  done
+  files=$((files + 2))
+  if command -v du >/dev/null 2>&1; then
+    bytes=$((bytes + $(du -sk "$CACHE" | cut -f1) * 1024))
+  fi
+  elapsed=$(( $(date +%s) - start ))
+  echo "SUMMARY scenario=compile files_written=$files bytes_written=$bytes elapsed_s=$elapsed compiler=$GO"
+  exit 0
+fi
 
 echo "compile workload: $UNITS units x $ROUNDS rounds with $CC"
 echo "work directory: $WORK"

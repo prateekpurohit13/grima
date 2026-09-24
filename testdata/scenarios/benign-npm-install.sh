@@ -12,7 +12,7 @@
 # Prints one SUMMARY line at the end: files, bytes and elapsed seconds.
 set -uo pipefail
 
-WORK="${1:-${TMPDIR:-/tmp}/grima-benign-npm-install}"
+WORK="${1:-${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/grima-benign-npm-install}"
 PKGS="${GRIMA_NPM_PACKAGES:-200}"
 MODULES="${GRIMA_NPM_MODULES:-6}"
 
