@@ -36,6 +36,20 @@ param(
     [int]$DurationSeconds = 25,
     [string]$WorkDir = "$env:TEMP\grima-attrib-verify",
     [string]$Binary = "",
+
+    # How long a file event waits for its audited record before falling back to
+    # correlation. This is the knob the score turns on: every causal decision is
+    # correct and every fallback is wrong, so a longer wait captures more events
+    # and costs detection latency.
+    [string]$MaxDelay = "300ms",
+
+    # Sweep several delays in one elevated run and report the curve, instead of
+    # measuring a single point. One UAC prompt rather than one per value.
+    # Comma-separated, because a [string[]] parameter does not bind through
+    # -File: "100ms,300ms" arrives as a single element and fails to parse.
+    [switch]$Sweep,
+    [string]$SweepDelays = "100ms,300ms,500ms,1s",
+
     [switch]$AllowUnelevated
 )
 
@@ -124,17 +138,30 @@ Write-Host "work dir: $WorkDir"
 # ---------------------------------------------------------------------- rounds
 
 $results = @()
+$delays = if ($Sweep) {
+    @($SweepDelays -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+} else {
+    @($MaxDelay)
+}
+if ($Sweep) {
+    Write-Host ("sweeping {0} delays x {1} rounds = {2} detector runs" -f `
+        $delays.Count, $Rounds, ($delays.Count * $Rounds))
+}
+
+foreach ($delay in $delays) {
+if ($Sweep) { Write-Head "max_delay $delay" }
 
 for ($round = 1; $round -le $Rounds; $round++) {
-    Write-Head "round $round of $Rounds"
+    Write-Head "round $round of $Rounds at max_delay $delay"
 
     Remove-Item -Recurse -Force $dataDir -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
-    $trace = Join-Path $WorkDir "trace-$round.jsonl"
-    $config = Join-Path $WorkDir "grima-$round.toml"
-    $log = Join-Path $WorkDir "detector-$round.log"
-    $errLog = Join-Path $WorkDir "detector-$round.err.log"
+    $tag = if ($Sweep) { "$delay-$round" } else { "$round" }
+    $trace = Join-Path $WorkDir "trace-$tag.jsonl"
+    $config = Join-Path $WorkDir "grima-$tag.toml"
+    $log = Join-Path $WorkDir "detector-$tag.log"
+    $errLog = Join-Path $WorkDir "detector-$tag.err.log"
     Remove-Item -Force $trace, $config, $log, $errLog -ErrorAction SilentlyContinue
 
     $escapedData = $dataDir.Replace('\', '\\')
@@ -146,7 +173,7 @@ log_level = "info"
 
 [attribution]
 mode = "audit"
-max_delay = "300ms"
+max_delay = "$delay"
 audit_setup = true
 
 [decoy]
@@ -200,6 +227,7 @@ baseline_path = "$escapedBaseline"
     $causal = @($decisions | Where-Object { $_.source -eq "causal" }).Count
 
     $results += [pscustomobject]@{
+        Delay      = $delay
         Round      = $round
         WriterPid  = $writerPid
         Started    = [bool]$started
@@ -213,6 +241,7 @@ baseline_path = "$escapedBaseline"
 
     Write-Host ("decisions {0}, correct {1}, accuracy {2:P1}, causal {3}, correlate {4}" -f `
         $summary.total, $summary.correct, $summary.accuracy, $causal, ($summary.total - $causal))
+}
 }
 
 # ------------------------------------------------------------------- aggregate
@@ -228,6 +257,29 @@ Write-Host ("decisions {0}, correct {1}, causal {2} ({3:P1} of decisions)" -f `
     $totalDecisions, $totalCorrect, $totalCausal, $(if ($totalDecisions -gt 0) { $totalCausal / $totalDecisions } else { 0 }))
 Write-Host ("accuracy {0:P1}" -f $accuracy)
 
+if ($Sweep) {
+    Write-Head "curve"
+    $curve = foreach ($delay in $delays) {
+        $d = @($results | Where-Object { $_.Delay -eq $delay })
+        $dec = ($d | Measure-Object -Property Decisions -Sum).Sum
+        $cor = ($d | Measure-Object -Property Correct -Sum).Sum
+        $cau = ($d | Measure-Object -Property Causal -Sum).Sum
+        [pscustomobject]@{
+            MaxDelay  = $delay
+            Rounds    = $d.Count
+            Decisions = $dec
+            Correct   = $cor
+            Causal    = $cau
+            Correlate = $dec - $cau
+            Accuracy  = if ($dec -gt 0) { "{0:P1}" -f ($cor / $dec) } else { "-" }
+        }
+    }
+    $curve | Format-Table -AutoSize | Out-String | Write-Host
+    Write-Host "Pick the smallest delay whose accuracy has stopped rising. A longer wait buys"
+    Write-Host "nothing once the late records are captured, and it costs detection latency:"
+    Write-Host "a file event cannot be scored until it has been attributed."
+}
+
 if (-not ($results | Where-Object { $_.Started })) {
     Write-Host ""
     Write-Host "the audit mechanism never started, so this run does not measure it." -ForegroundColor Yellow
@@ -242,5 +294,10 @@ if ($accuracy -ge 0.9) {
 } else {
     Write-Host ("GATE NOT MET: {0:P1} of {1} decisions named the right process." -f $accuracy, $totalDecisions) -ForegroundColor Red
 }
-Write-Host "Traces and logs are in $WorkDir. Record the number in docs/sprints.md section 11."
+Write-Host "Traces and logs are in $WorkDir."
+if ($Sweep) {
+    Write-Host "Record the curve and the chosen default in docs/sprints.md section 22."
+} else {
+    Write-Host "Record the number in docs/sprints.md section 11."
+}
 exit 0
