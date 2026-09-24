@@ -1193,3 +1193,32 @@ without erasing it: `write_burst` fell from 0.81 to 0.19 in one pass, and repeat
 converge rather than one pass settling it. The extension signal *is* fully absorbed, because
 promotion is absolute. Worth knowing before telling an operator "recalibrate once and it goes
 away".
+
+### Provenance: some Sprint 2 measurements predate these fixes
+
+The figures in §17, §18 and the drip-fragmentation finding were taken **before** the
+`FILE_SHARE_DELETE`, per-kind-rate, `rateBaseline` and weight changes landed, against the
+binary in `.sprint2/RateScenarios/`. Re-running the corpus against the current build will not
+reproduce them:
+
+- `cum_bytes_rewritten` now reads about **half** what was reported, because the rename
+  double-count is gone;
+- the quiet-drip attribution split across four fingerprints was sensitive to the 2 s
+  attribution window, and attribution behaviour changed;
+- the atomic-save figure moved 56.6 → 45.1 as contributors were removed.
+
+The *conclusions* hold — each was a real defect with a mechanism — but the numbers are
+pinned to a specific build. Anyone re-running for the ablation should re-measure rather than
+quote these. That is Sprint 4 item 4.11, and it now covers more than the scratch programs.
+
+### Framing for 4.9 and 4.10
+
+The residual 45.1 is not a weight question. The workload is 480 saves across 8 directories in
+27 s, with no deletes of the *targets* — the deletes are the temp files each save replaces —
+and only a mild entropy shift because the payload is small config text.
+
+So the question is not "is 53 operations/s too low a bar" but **"should a batch config-manager
+save look like bulk I/O at all?"** The direction of the fix may be a workload-shape signal
+rather than a weight: distinguishing a save pattern from an encryption pattern needs something
+that sees the *shape*, which no current signal does. Worth deciding before spending a sprint
+tuning numbers.
