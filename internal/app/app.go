@@ -199,12 +199,11 @@ func runRecalibration(ctx context.Context, cfg config.Config, events *bus.Bus, l
 
 	log.Info("recalibrating host baseline", "warmup", cfg.Calibration.Warmup.Std().String())
 
+	// Recalibrate merges into the stored baseline and persists it; saving again
+	// here would write the same bytes twice.
 	merged, err := calibrate.Recalibrate(ctx, cfg, events, existing)
 	if err != nil {
 		return fmt.Errorf("recalibrate: %w", err)
-	}
-	if err := merged.Save(cfg.Calibration.BaselinePath); err != nil {
-		return fmt.Errorf("save baseline: %w", err)
 	}
 
 	log.Info("baseline recalibrated",
