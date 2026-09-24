@@ -195,9 +195,15 @@ func TestAttributionMaxDelayMustBePositive(t *testing.T) {
 }
 
 func TestLoadAttributionSection(t *testing.T) {
+	// A genuinely absolute path for the platform under test: "C:\data" is not
+	// absolute on Linux, where a backslash is not a separator, so a hardcoded
+	// Windows path makes this test fail on the Linux runner for a reason that
+	// has nothing to do with the attribution section it is meant to cover.
+	monitor := filepath.ToSlash(t.TempDir())
+
 	path := writeConfig(t, `
 [general]
-monitor_paths = ["C:\\data"]
+monitor_paths = ["`+monitor+`"]
 
 [attribution]
 mode = "audit"

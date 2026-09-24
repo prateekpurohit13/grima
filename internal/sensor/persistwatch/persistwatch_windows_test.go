@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/prateekpurohit13/grima/internal/config"
@@ -90,36 +91,64 @@ func TestScanPersistenceFailsWhenNothingIsReadable(t *testing.T) {
 	}
 }
 
-// Happy path: the current user's Run key exists on any host with a logon.
-func TestReadRunKeyReadsThisHostsRunKey(t *testing.T) {
-	if _, ok := readRunKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`); !ok {
-		t.Fatal("the current user's Run key must be readable")
+// createTestRunKey makes a throwaway key under HKCU holding the given values and
+// returns its path, deleting it when the test ends.
+//
+// Tests use their own key rather than the host's Run key: a fresh CI profile
+// often has none, so asserting that one exists asserts the host rather than the
+// code, and the test fails for a reason that has nothing to do with GRIMA.
+func createTestRunKey(t *testing.T, values ...string) string {
+	t.Helper()
+
+	path := `Software\GRIMA-test-` + strings.NewReplacer("/", "-", "\\", "-").Replace(t.Name())
+
+	key, _, err := registry.CreateKey(registry.CURRENT_USER, path, registry.SET_VALUE)
+	if err != nil {
+		t.Fatalf("create test key %s: %v", path, err)
+	}
+	for _, name := range values {
+		if err := key.SetStringValue(name, "cmd /c echo "+name); err != nil {
+			key.Close()
+			t.Fatalf("set value %s: %v", name, err)
+		}
+	}
+	key.Close()
+
+	t.Cleanup(func() {
+		if err := registry.DeleteKey(registry.CURRENT_USER, path); err != nil {
+			t.Logf("could not delete test key %s: %v", path, err)
+		}
+	})
+	return path
+}
+
+func TestReadRunKeyReadsAKeysValues(t *testing.T) {
+	path := createTestRunKey(t, "alpha", "beta")
+
+	values, ok := readRunKey(registry.CURRENT_USER, path)
+	if !ok {
+		t.Fatalf("readRunKey(%s) reported the key unreadable", path)
+	}
+	if len(values) != 2 {
+		t.Fatalf("values = %v, want alpha and beta", values)
 	}
 }
 
-// The run-key path is exercised against the real registry: every value in the
-// current user's Run key becomes an entry named after the key and the value.
+// Every value in a run key becomes one entry, named after the key and the value.
 func TestScanPersistenceNamesRunKeyEntriesAfterKeyAndValue(t *testing.T) {
-	key := `Software\Microsoft\Windows\CurrentVersion\Run`
-	values, ok := readRunKey(registry.CURRENT_USER, key)
-	if !ok {
-		t.Fatalf("the current user's Run key must be readable")
-	}
+	path := createTestRunKey(t, "alpha", "beta")
 
-	pointScannerAt(t, []runKey{{registry.CURRENT_USER, key}}, nil, filepath.Join(t.TempDir(), "no-tasks"))
+	pointScannerAt(t, []runKey{{registry.CURRENT_USER, path}}, nil, filepath.Join(t.TempDir(), "no-tasks"))
 
 	entries, err := scanPersistence()
 	if err != nil {
 		t.Fatalf("scanPersistence: %v", err)
 	}
-	if len(entries) != len(values) {
-		t.Fatalf("entries = %d, want one per Run value (%d)", len(entries), len(values))
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want one per value (2)", len(entries))
 	}
 
-	want := make(map[string]bool, len(values))
-	for _, v := range values {
-		want[key+`\`+v] = true
-	}
+	want := map[string]bool{path + `\alpha`: true, path + `\beta`: true}
 	for _, e := range entries {
 		if e.kind != "runkey" {
 			t.Errorf("entry %q has kind %q, want runkey", e.path, e.kind)

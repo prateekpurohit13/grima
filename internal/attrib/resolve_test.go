@@ -2,6 +2,8 @@ package attrib
 
 import (
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -256,5 +258,55 @@ func TestTraceMarksCorrelatedDecisions(t *testing.T) {
 	lines := traceLines(t, path)
 	if len(lines) != 1 || !strings.Contains(lines[0], `"source":"correlate"`) {
 		t.Fatalf("trace line = %v, want the correlate source", lines)
+	}
+}
+
+// Concurrency: the sensor keeps producing events while the detector shuts down
+// and the health endpoint reads attribution state. Run under -race.
+func TestConcurrentResolveCloseAndStats(t *testing.T) {
+	a, _ := causalAttributor(t, 20*time.Millisecond)
+	a.Observe(9, "crypt", 0, `C:\Tools\crypt.exe`, 4096)
+
+	var wg sync.WaitGroup
+	var emitted atomic.Uint64
+	stop := make(chan struct{})
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					a.Resolve(event.Event{Kind: event.KindFileWrite, Path: `C:\a.txt`, Time: time.Now()},
+						func(event.Event) { emitted.Add(1) })
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = a.Stats()
+			}
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	if err := a.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+
+	if emitted.Load() == 0 {
+		t.Fatal("want events emitted while the detector was shutting down")
 	}
 }
