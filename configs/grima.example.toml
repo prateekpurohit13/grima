@@ -1,0 +1,128 @@
+# GRIMA example configuration.
+#
+# Every setting here has a built-in default, so the binary runs with no config
+# file at all. This file documents the surface and is the recommended starting
+# point.
+#
+# GRIMA rejects unknown keys rather than ignoring them, so a typo surfaces at
+# startup instead of silently disabling a setting.
+
+[general]
+# Directories to watch. Must be absolute paths. Anything outside this list is
+# invisible to the detector.
+monitor_paths = ["/home", "/srv"]
+log_level = "info"
+
+[bus]
+# Bounded queue. An encryption storm is an overload condition, so the bus drops
+# by policy and counts every drop instead of growing without limit.
+capacity = 8192
+drop_policy = "drop_oldest"   # drop_oldest | drop_newest | block
+
+[filewatch]
+# Bytes sampled from the head and the tail of a changed file. Sampling rather
+# than reading whole files bounds I/O under a storm, and the tail sample also
+# catches partial encryption that leaves the middle of a file untouched.
+entropy_sample_bytes = 4096
+# Re-read recently modified files when the OS notification buffer overflows, so
+# a storm that outran the buffer still reaches the fingerprint window.
+rescan_on_overflow = true
+sample_interval = "2s"
+
+[procwatch]
+# How often the process table is sampled. Lower means tighter attribution and
+# more CPU.
+sample_interval = "1s"
+
+[decoy]
+# Canary files. A legitimate process has no reason to touch a file the user
+# never created, which makes this the highest-precision signal available.
+enabled = true
+names = ["_grima_canary.doc", "quarterly_report_2019.xlsx", "invoices_backup.pdf"]
+count_per_dir = 2
+
+[window]
+# Decay for the burst track. The cumulative track never decays, which is what
+# catches slow drip encryption.
+decay_half_life = "30s"
+ngram_length = 32
+
+[calibration]
+# Capture the host baseline with: grima --config <this> --calibrate
+warmup = "10m"
+min_samples = 200
+baseline_path = "grima-baseline.json"
+# Floor on the standard deviation of an extension's entropy distribution, so a
+# degenerate distribution never divides by zero.
+entropy_sigma_floor = 0.05
+
+[scoring]
+level_bands = { low = 20, medium = 45, high = 70, critical = 88 }
+
+# Writes per second treated as suspicious when no host baseline exists. It is
+# replaced by the calibrated write_burst signal as soon as a baseline is
+# available, so this only affects uncalibrated mode.
+absolute_write_rate = 20
+
+# Fusion weights. These defaults are a starting point; Phase 6 replaces them
+# with values from a grid search over the scenario corpus.
+[[scoring.weights]]
+name = "entropy_deviation"
+weight = 1.0
+[[scoring.weights]]
+name = "magic_mismatch"
+weight = 1.0
+[[scoring.weights]]
+name = "write_burst"
+weight = 1.0
+[[scoring.weights]]
+name = "write_rate_absolute"
+weight = 1.0
+[[scoring.weights]]
+name = "rename_burst"
+weight = 0.8
+[[scoring.weights]]
+name = "unknown_extension_activity"
+weight = 1.0
+[[scoring.weights]]
+name = "delete_rate"
+weight = 0.5
+[[scoring.weights]]
+name = "dir_fanout"
+weight = 0.5
+[[scoring.weights]]
+name = "cum_bytes_rewritten"
+weight = 0.5
+[[scoring.weights]]
+name = "bus_drops"
+weight = 0.2
+
+[rules]
+# Patterns are matched case-insensitively against a process command line.
+enabled = true
+
+# Anti-recovery commands. Deleting shadow copies or the recovery catalog is a
+# strong pre-encryption indicator.
+shadow_commands = [
+  "vssadmin delete shadows",
+  "wmic shadowcopy delete",
+  "wbadmin delete catalog",
+  "bcdedit /set recoveryenabled no",
+]
+eventlog_commands = ["wevtutil cl", "Clear-EventLog"]
+usn_commands = ["fsutil usn deletejournal"]
+
+# A terminator acting on one of these names is treated as backup destruction.
+terminators = ["taskkill", "pkill", "killall", "Stop-Process", "net stop"]
+backup_processes = ["sqlservr", "veeam", "backup exec", "beserver", "postgres", "mysqld", "mongod"]
+
+[response]
+# Off by default. Suspending a process on a heuristic score is a
+# denial-of-service risk, so it must be opted into and stays gated on critical.
+enable_suspend = false
+suspend_min_level = "critical"
+alert_min_level = "medium"
+
+[web]
+enabled = true
+listen = "127.0.0.1:8787"
