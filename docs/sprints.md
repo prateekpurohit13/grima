@@ -1,0 +1,501 @@
+# GRIMA — Sprint Plan
+
+Timeboxed implementation plan. The roadmap in [`plan.md`](plan.md) §7 says *what* the
+phases are; this says *who does what, in what order, and how we know it is finished*.
+
+---
+
+## Table of Contents
+
+1. [Assumptions](#1-assumptions)
+2. [Team and Workstreams](#2-team-and-workstreams)
+3. [Definition of Done](#3-definition-of-done)
+4. [Sprint Overview](#4-sprint-overview)
+5. [Sprint Detail](#5-sprint-detail)
+6. [Parallel Paper Track](#6-parallel-paper-track)
+7. [Critical Path](#7-critical-path)
+8. [Cut List](#8-cut-list)
+9. [Known Gaps Carried Into Sprint 1](#9-known-gaps-carried-into-sprint-1)
+10. [What Dropping Linux Costs](#10-what-dropping-linux-costs)
+11. [Attribution: The Measured Result](#11-attribution-the-measured-result)
+12. [Why Item 1.5 Is Blocked](#12-why-item-15-is-blocked)
+
+---
+
+## 1. Assumptions
+
+| Assumption | Value | Adjust if wrong |
+|---|---|---|
+| Sprint length | 2 weeks | — |
+| Team size | 3 | — |
+| Working capacity | ~10 h/person/sprint | Course load varies |
+| Phase 0 (docs + scaffolding) | **Complete** | Verified: builds, tests, smoke test passes |
+| Sprint 1 start | 2026-09-28 | Maps to the real deadline |
+| Remaining sprints | 5 + 1 buffer = 12 weeks | Cut from the bottom of §8 |
+
+Dates are deliberately expressed as *sprint numbers* rather than calendar dates, because
+the submission deadline drives how many sprints exist, not the other way round. Map
+sprint *n* to `start + (n-1) × 2 weeks` once the deadline is known.
+
+**If fewer than 5 sprints are available**, apply the cut list in §8 in order. Sprint 4 is
+never cut — it is the paper's contribution.
+
+---
+
+## 2. Team and Workstreams
+
+Three workstreams, deliberately non-overlapping so nobody blocks anyone:
+
+| Workstream | Scope | Packages |
+|---|---|---|
+| **W1 — Sensing** | Sensors, platform dispatch, attribution, decoys | `internal/sensor/*`, `internal/platform`, `internal/attrib`, `internal/decoy` |
+| **W2 — Detection** | Fingerprint engine, calibration, scoring, rules | `internal/fingerprint`, `internal/calibrate`, `internal/score`, `internal/rules` |
+| **W3 — Evaluation & Paper** | Harness, scenarios, metrics, writing, figures | `testdata/`, `docs/`, paper |
+
+**Proposed ownership** (reassign freely — this is a starting split, not a decision):
+
+| Person | Reg. No. | Primary | Secondary |
+|---|---|---|---|
+| Soham Mahapatra | 23BCI0074 | W1 | Paper §IV |
+| Vaibhav Sijaria | 23BCI0063 | W2 | Paper §II–III |
+| Prateek Purohit | 23BCI0066 | W3 | Paper §V–VI |
+
+Every person reviews at least one sprint deliverable outside their own workstream. The
+paper is not one person's job.
+
+**Interface discipline.** W2 depends on the frozen `event` contract and the `Source`
+interface, both of which are already fixed in [`design.md`](design.md) §2–§3. W1 must not
+change them without updating `design.md` in the same commit — that is what keeps the two
+workstreams parallel instead of serial.
+
+---
+
+## 3. Definition of Done
+
+A sprint item is done when **all** of these hold. This mirrors `SKILLS.md` §15 and
+`AGENTS.md`; it is the same bar every time.
+
+1. Code builds, `go vet` clean, `gofmt` clean.
+2. Happy path **and** sad path tested, asserting observable behaviour (counts, levels,
+   error returns) — not log wording or internal fields.
+3. No new dead configuration. A config key that is parsed but never read is a bug, not a
+   placeholder.
+4. Docs updated in the same commit if behaviour or an interface changed.
+5. Evidence recorded: the command run and its output, not a claim that it works.
+6. `THIRD_PARTY_NOTICES.md` updated if code or rule logic came from elsewhere.
+7. Demoable at sprint review: someone other than the author runs it and sees it work.
+
+---
+
+## 4. Sprint Overview
+
+| Sprint | Goal | Workstreams | Exit criterion |
+|---|---|---|---|
+| **1** | Trustworthy sensing | W1 (lead), W2, W3 | Sensors verified on Windows; attribution accuracy measured; decoy touch demonstrably fires |
+| **2** | Fingerprint and calibration complete | W2 (lead), W1, W3 | Drip encryption caught by cumulative track; n-gram either implemented or removed; calibration reloads and recalibrates |
+| **3** | Rules, response, multi-process | W2 (lead), W1, W3 | Cerberus-style split workload detected; suspend path exercised under its gate |
+| **4** | **Evaluation harness** | W3 (lead), all | Ablation table with DR, FPR/24h, TTD-in-bytes across signal subsets |
+| **5** | Results and paper | all | Results section written from real numbers; system frozen |
+| **Buffer** | Slip absorption, macOS or scope statement, packaging | all | Submission-ready |
+
+---
+
+## 5. Sprint Detail
+
+### Sprint 1 — Trustworthy sensing
+
+**Goal.** The detector must be demonstrably correct about *what happened* before anyone
+trusts it about *what it means*. Phase 0 proved the pipeline moves data; it did not prove
+the sensors are accurate.
+
+| # | Item | WS | Exit criterion |
+|---|---|---|---|
+| 1.1 | Exercise the FileWatch overflow rescan path | W1 | Overflow induced (buffer size reduced in a test), subtree re-scanned, synthetic events counted |
+| 1.2 | Verify PersistWatch on real hosts | W1 | Windows: Run key + Scheduled Task + Startup file each produce `persistence_install`. Linux: cron + systemd unit each do |
+| 1.3 | Measure ProcWatch cost | W1 | CPU and wall time of one process scan on a 300+ process host, recorded; interval tuned from the number |
+| 1.4 | **Measure attribution accuracy** | W1 | Known-writer scenario: a named process writes N files; detector identifies it correctly for ≥90% of events |
+| 1.5 | Attribution upgrade if 1.4 fails | W1 | ETW (`Microsoft-Windows-Kernel-File`) on Windows, auditd on Linux; no custom driver |
+| 1.6 | Verify decoy touch fires | W1 | A write to a planted decoy raises `R-DECOY-TOUCH` at critical |
+| 1.7 | Sensor health honesty | W2 | Every sensor reports non-zero events when exercised; a sensor that cannot start is absent from `/healthz`, not silently zero |
+
+### Sprint 1 outcome
+
+| # | Item | Result |
+|---|---|---|
+| 1.1 | Overflow rescan | **Done.** Extracted `handleWatchError` so the branch is reachable; 6 tests. Revert-checked: removing the `rescan` call makes the test fail. |
+| 1.2 | PersistWatch verified | **Done.** 9 tests; 17 baseline entries catalogued on this host; a new Startup-folder entry detected at runtime; pre-existing entries correctly silent. |
+| 1.3 | ProcWatch cost | **Done.** 14–49 ms per sample pass, ≈1.4–4.9% of one core at the 1 s default — the default is justified. 167 processes return empty `Exe()`/`Cmdline()` on this host, with no error, which bounds what attribution can rely on. |
+| 1.4 | **Attribution accuracy** | ❌ **FAILED.** Measured 0% (1,255 decisions over 5 rounds, solo writer). Exit criterion was ≥90%. |
+| 1.5 | Attribution upgrade | ⛔ **BLOCKED.** The named mechanism (ETW kernel provider) requires elevation, which this host does not have, and no non-admin alternative survives testing. Evidence in §12. |
+| 1.6 | Decoy touch fires | **Done.** `KindDecoyTouch` + `DecoyID` verified in unit tests and end to end at critical. |
+| 1.7 | Sensor health honesty | **Done.** `Reporting` on `sensor.Stats`; 5 tests over the `/healthz` shape a consumer parses. |
+| 1.8 | Linux smoke test | **Cut by decision** (§10). |
+
+**Audit result.** An independent review of the sprint found two blocker-class defects, both
+now fixed:
+
+1. **A data race in `procwatch`** — the sample loop wrote the process map while `/healthz`
+   read its length, with no synchronisation. `go test -race` caught it. In Go a concurrent
+   map read and write is a *fatal* error, not a recoverable one, so any health scrape could
+   have crashed the detector. Fixed with an atomic counter; `persistwatch` had the same
+   latent defect and is fixed the same way. A regression test now exercises concurrent
+   `Stats` reads against a running sampler.
+2. **A test that did not test what it claimed** — the decoy path-spelling test could not
+   fail, because `filepath.Join` cleans paths, so both sides were always clean. Rebuilt
+   with a genuinely unclean path.
+
+Two further findings were fixed: the attribution trace silently under-counted when it hit
+its line cap (now reported on stderr at close), and the trace's off-by-default test asserted
+an internal field rather than observable behaviour.
+
+**Why 1.4 matters most.** The Phase 0 smoke test blamed `firefox.exe` for the encryptor's
+writes. Detection was correct; the blamed process was not. Sprint 1 measured this properly,
+and the result is worse than the anecdote suggested — see §11.
+
+**Sprint review demo:** run the encryptor while a background bulk writer runs; show the
+alert names the right process, or show the measured accuracy number that explains why not.
+
+---
+
+### Sprint 2 — Fingerprint and calibration complete
+
+**Goal.** Make the dual-track design provable and resolve the n-gram gap.
+
+| # | Item | WS | Exit criterion |
+|---|---|---|---|
+| 2.1 | **Resolve the n-gram gap** | W2 | Either an n-gram signal is computed from the ring and appears in verdicts, or the claim and `window.ngram_length` are deleted. No third option |
+| 2.2 | Drip-encryption validation | W2 | `encryptor.py --rate drip` (1 file / 5s) crosses threshold on the cumulative track while the decaying window stays flat |
+| 2.3 | Intermittent-encryption validation | W2 | `--rate intermittent` detected; confirm the tail sample is what catches it |
+| 2.4 | Calibration round-trip | W2 | Baseline saved, reloaded, `calibration_ready: true`; a stale baseline is rejected |
+| 2.5 | Recalibration feedback | W2 | An operator-confirmed benign workload stops alerting after recalibration |
+| 2.6 | Tree aggregation under a real split | W1 | A parent that forks N children each below threshold is scored as one actor above threshold |
+| 2.7 | Fingerprint memory bound | W2 | Live process count × ring capacity verified bounded over a long run; `Reap` confirmed on exit |
+| 2.8 | Scenario corpus, first cut | W3 | Benign workloads scripted and repeatable: compile, `npm install`, archive, video encode |
+
+**Sprint review demo:** drip encryption caught live — the case that defeats every
+fixed-window detector.
+
+---
+
+### Sprint 3 — Rules, response, multi-process
+
+**Goal.** Close the remaining literature gaps in the implementation and make the response
+path real.
+
+| # | Item | WS | Exit criterion |
+|---|---|---|---|
+| 3.1 | Expand and cross-check the rule set | W2 | Each rule has a table-driven test with matching and non-matching cases; patterns cross-checked against the Sigma corpus, attribution recorded |
+| 3.2 | Exercise the suspend path | W2 | With `enable_suspend = true` and a critical verdict, the target is suspended; with the flag off, it is not |
+| 3.3 | Cerberus-style split scenario | W3 | A workload splitting encryption across cooperating children is built and detected |
+| 3.4 | Alert throttling option | W2 | A persistent condition produces one alert per incident, not one per second, when enabled |
+| 3.5 | Dashboard per-tree view | W2 | Tree aggregate visible with its contributing process list |
+| 3.6 | Bus saturation behaviour | W1 | Under a write storm, drops are counted and surfaced as signal 13, not silently lost |
+| 3.7 | Failure-injection pass | W3 | Each row of `architecture.md` §13 failure table exercised at least once |
+
+**Sprint review demo:** the split-process attack, which per-process classifiers miss.
+
+---
+
+### Sprint 4 — Evaluation harness *(the paper's contribution)*
+
+**Goal.** Produce the numbers. Everything before this is infrastructure.
+
+| # | Item | WS | Exit criterion |
+|---|---|---|---|
+| 4.1 | Benign corpus, expanded | W3 | ≥6 representative workloads with recorded activity profiles |
+| 4.2 | Attack corpus | W3 | Controlled encryptor at 3 rates + real families in an isolated snapshot VM |
+| 4.3 | **Ablation runner** | W3 | Signal subsets (`rules_only`, `+entropy`, `+rename`, `+calibration`, `all`) each produce a full metric row |
+| 4.4 | Metrics | W3 | DR @ 1% FPR, **TTD in bytes encrypted before alert**, FPR per 24h benign, CPU/RSS overhead |
+| 4.5 | Generalization split | W3 | Train/tune on family A, test on family B |
+| 4.6 | Weight tuning | W2 | Weights from grid search on a held-out split, not on the reported scenarios |
+| 4.7 | Figures | W3 | Ablation table + TTD distribution + ROC/PR curve |
+| 4.8 | Overhead measurement | W1 | Idle and under-load CPU/RSS, compared against no detector |
+
+**Safety, non-negotiable for 4.2:** isolated VM, snapshots, host-only network, no shared
+folders, Defender exclusions inside the test VM only. Prefer the simulator for the demo.
+
+**Exit criterion for the sprint:** a table where every row is a real measurement from a
+reproducible command. If a row does not move the numbers, say so in the paper — a signal
+that earns nothing is worth reporting as such.
+
+---
+
+### Sprint 5 — Results and paper
+
+| # | Item | WS | Exit criterion |
+|---|---|---|---|
+| 5.1 | Results section from real output | all | Every number traceable to a command in `testdata/` |
+| 5.2 | Fix all citations | all | Every reference resolves to a DOI or URL; the five unverifiable ones replaced or removed |
+| 5.3 | Rewrite §II.E and §IV for the ML-free design | W2 | No claim of a pretrained classifier or unsupervised model remains |
+| 5.4 | Threats to validity | all | Attribution limits, decoy detectability, single-host scope, monitor killability |
+| 5.5 | System freeze | all | No feature changes after this point; bug fixes only |
+
+---
+
+### Buffer sprint
+
+Slip absorption first. Then, in order: macOS sensor set, packaging, reproduction
+instructions, `README` polish. Nothing here is load-bearing.
+
+---
+
+## 6. Parallel Paper Track
+
+The paper is graded, so it runs alongside the code rather than after it. One section per
+sprint, written from what that sprint actually produced:
+
+| Sprint | Paper section | Source of truth |
+|---|---|---|
+| 1 | §II Background — sensing approaches | Sprint 1 measurements |
+| 2 | §III gaps, restated against what the implementation showed | Sprint 2 evidence |
+| 3 | §IV design — final architecture | Frozen `architecture.md` |
+| 4 | §V evaluation, §VI results | Sprint 4 numbers |
+| 5 | Abstract, intro, threats to validity, conclusion | All of the above |
+
+**Do not write results before Sprint 4.** A design section written before the numbers
+exist tends to promise things the numbers then contradict — which is exactly how the
+current draft ended up claiming ML it is not using.
+
+---
+
+## 7. Critical Path
+
+```mermaid
+flowchart LR
+    S1["Sprint 1<br/>Sensing verified"] --> S2["Sprint 2<br/>Fingerprint + calibration"]
+    S2 --> S4["Sprint 4<br/>Evaluation harness"]
+    S3["Sprint 3<br/>Rules + multi-process"] --> S4
+    S4 --> S5["Sprint 5<br/>Results + paper"]
+
+    P["Paper track<br/>one section per sprint"] -.-> S5
+```
+
+- **Sprint 4 is the critical path.** It cannot start before 2 and 3 produce a stable
+  detector, and Sprint 5 cannot start before it.
+- **Sprint 1 gates Sprint 2's tree work.** If attribution is unreliable, tree-level
+  scoring degrades to host-level scoring, which changes what the paper can claim.
+- **Sprints 1 and 3 can partially overlap** — rules work (3.1, 3.2) does not depend on
+  sensor accuracy.
+
+---
+
+## 8. Cut List
+
+Cut from the top when time is short. **Sprint 4 is never cut.**
+
+| Order | Cut | Cost of cutting |
+|---|---|---|
+| 1 | Dashboard features beyond the current view | None — the demo still works |
+| 2 | Non-Windows sensor verification (Linux, macOS) | **Already cut.** Scope statement required: "verified on Windows"; cross-platform remains a design property, not a measured one |
+| 3 | Alert throttling (3.4) | Log noise during an incident |
+| 4 | Suspend path (3.2) | Observe-only; defensible, since suspend is opt-in anyway |
+| 5 | Generalization split (4.5) | Weakens the headline claim — cut only under real pressure |
+| 6 | Real-family testing (4.2 second half) | Falls back to the simulator; weaker but honest |
+
+---
+
+## 9. Known Gaps Carried Into Sprint 1
+
+Verified against the code, not assumed:
+
+| Gap | Evidence | Where it lands |
+|---|---|---|
+| **`window.ngram_length` is dead config** | Parsed, defaulted, validated — never read. No n-gram feature or signal exists, though `design.md` §6 and `architecture.md` §6 both describe one | Sprint 2 item 2.1 |
+| **Attribution is unreliable — measured** | Sprint 1 measured 0% accuracy on the solo-writer case (1,255 decisions, 5 rounds). Detection unaffected. See §11 | Sprint 2: adopt ETW/auditd, or reframe to tree-level claims |
+| ~~Decoy touch never observed firing~~ | **Resolved in Sprint 1** — verified in unit tests and end to end at critical | Done |
+| **Suspend path untested** | Implemented for Windows and POSIX, never executed | Sprint 3 item 3.2 |
+| ~~Overflow rescan untested~~ | **Resolved in Sprint 1** — 6 tests, revert-checked so the test fails if the rescan call is removed | Done |
+| **Non-Windows hosts unverified** | All verification ran on Windows. Linux and macOS adapters compile but have never observed a real event | Scope statement in the paper; see §10 |
+| **`static_reputation` signal absent** | Documented as Phase 7; correctly marked "not yet emitted" in `design.md` §5 | Buffer or never |
+
+---
+
+## 10. What Dropping Linux Costs
+
+Linux verification was cut by decision. This section records the consequence so it is not
+discovered during the viva.
+
+**What is still true.** The platform dispatch layer exists, the per-OS adapters compile for
+Linux and macOS, and `CGO_ENABLED=0 GOOS=linux go build` produces a static binary. The
+architecture is genuinely cross-platform by construction.
+
+**What is no longer true.** *Cross-platform is a design property, not a measured one.* No
+Linux or macOS host has ever produced an event through this code. Nothing in the evaluation
+can support a claim that the system works on a second platform.
+
+**The cost lands on Gap 1.** Gap 1 — "lack of cohesive cross-platform implementations" — is
+the first gap the paper identifies, and the project's answer to it was a user-space design
+plus a platform-dispatch layer. With Linux unverified, the paper can claim:
+
+> The architecture avoids OS lock-in by construction and ships adapters for Linux and macOS,
+> but evaluation is limited to Windows. Cross-platform efficacy is unmeasured.
+
+It **cannot** claim the gap is closed. Stating it as closed would be a claim about a system
+nobody has run on the platform in question.
+
+**Where this must be said:**
+1. `README.md` — the cross-platform claim must be qualified where it appears.
+2. `plan.md` §5 — the Gap 1 row must stop reading as "addressed" and start reading as
+   "addressed by design, unverified in evaluation".
+3. `plan.md` §9 Non-Goals — non-Windows verification belongs there.
+4. The paper's Threats to Validity section — as a first-class limitation, not a footnote.
+5. `architecture.md` §3 — the platform table must mark Linux and macOS as unverified.
+
+**What would restore the claim.** Item 1.8 as originally written: cross-compile, run against
+a native filesystem, confirm `filewatch` produces events and `persistwatch` scans cron and
+systemd. Roughly half a sprint. It is the cheapest gap to recover and the most expensive to
+leave unstated.
+
+**Do not** describe the system as cross-platform in the abstract without the qualifier. A
+reviewer who notices the claim is unevidenced will discount everything else in the paper.
+
+---
+
+## 11. Attribution: The Measured Result
+
+Sprint 1 item 1.4 asked whether the detector can name the process that wrote a file. The
+answer is **no**, and the measurement is unambiguous.
+
+### The number
+
+Condition: solo writer, 65 files of 4 KiB, no deliberate background load — the *easiest*
+case, with exactly one process doing the writing. Five rounds:
+
+| Round | Writer PID | Decisions | Correct | Accuracy | Blamed instead |
+|---|---|---|---|---|---|
+| 1 | 27160 | 215 | 0 | 0.0% | `firefox.exe` ×215 |
+| 2 | 33128 | 260 | 0 | 0.0% | `firefox.exe` ×260 |
+| 3 | 37612 | 260 | 0 | 0.0% | `firefox.exe` ×260 |
+| 4 | 44636 | 260 | 0 | 0.0% | `firefox.exe` ×260 |
+| 5 | 15584 | 260 | 0 | 0.0% | `firefox.exe` ×260 |
+| **Total** | — | **1,255** | **0** | **0.0%** | — |
+
+Across every other condition tested (paced writes, 4 MiB files, with and without a
+deliberate background writer) the best observed rate was **19.1%**. The 90% bar is not
+merely unmet; the mechanism does not work.
+
+### Why it fails
+
+`Suspect` picks the process with the largest recent write-*byte* delta. A browser writing
+hundreds of kilobytes to its cache in the same sample interval beats a process writing 65
+small files, every time — and the writer is not even a candidate. Writing 4 MiB files
+instead of 4 KiB files does not help, so this is not a file-size problem; byte volume is
+simply the wrong discriminator for small-file workloads, which is exactly the ransomware
+workload.
+
+### The confidence figure is actively misleading
+
+Confidence reached **0.92** in a round where every single decision was wrong. It is defined
+as the top writer's share of recent write volume, so it measures *byte dominance* — how
+concentrated the volume was — and not the probability that the blamed process is correct.
+Reporting it as a confidence would be worse than reporting nothing.
+
+### What survives
+
+**Detection is unaffected.** The signals that matter — entropy deviation, magic-byte
+mismatch, extension novelty — are properties of the *file*, not the process, so they land
+in whichever fingerprint received the events. In the same runs that scored 0% attribution,
+verdicts reached **critical (100.0)** on correct evidence. The detector knows what happened
+and is wrong about who did it.
+
+**Tree aggregation partially compensates.** The true writer frequently appears inside the
+blamed process's tree, so tree-level scoring reaches it even when per-process scoring does
+not. The paper should make tree-level claims, not per-process ones.
+
+### What to do
+
+1. **State the measured bound.** "Per-process attribution via write-volume correlation
+   achieved 0% on the solo-writer case; detection was unaffected." That is a legitimate,
+   useful result — it quantifies a limitation of the entire user-space correlation approach,
+   which the literature generally does not.
+2. **Adopt causal attribution** in Sprint 2 if per-process claims are wanted: ETW
+   (`Microsoft-Windows-Kernel-File`) on Windows, auditd on Linux. Both report the writing
+   PID directly, are OS-provided, and require no custom driver.
+3. **Reframe if not.** If Sprint 2 cannot absorb that work, the honest framing is
+   host-level and tree-level detection with an explicit statement that per-process blame is
+   not reliable. This is defensible and does not weaken the dual-track or calibration
+   contributions.
+
+### Reproducing it
+
+`SKILLS.md` §16 documents the trace facility (`GRIMA_ATTRIB_TRACE`),
+`testdata/scenarios/attribution.py` provides the known writer, and
+`testdata/scenarios/score_attribution.py` scores a trace against a writer PID.
+
+---
+
+## 12. Why Item 1.5 Is Blocked
+
+Item 1.5's exit criterion names a mechanism: *ETW (`Microsoft-Windows-Kernel-File`) on
+Windows; no custom driver*. Three facts, each verified on this host, put it out of reach
+here.
+
+### 1. The named mechanism requires elevation
+
+`Microsoft-Windows-Kernel-File` is a **kernel** ETW provider. Enabling it requires
+`SeSystemProfilePrivilege`, which means an elevated process. This host is not elevated:
+
+```
+$ net session
+NOT admin
+```
+
+The design intent behind item 1.5 was that ETW is OS-provided and therefore needs no custom
+driver — which is true. It was not accounted for that ETW is also **privileged**. "No driver"
+and "no elevation" are different claims, and only the first one holds.
+
+### 2. The only non-admin alternative is too slow
+
+The one causal signal available without elevation is enumerating system handles and asking
+which process holds the file. Measured on this host, one system-wide pass:
+
+```
+enumeration took 5.595s, denied=174
+```
+
+**5.6 seconds per pass.** File events arrive at hundreds per second during an encryption
+burst, so this cannot run on the event path at all. It is three orders of magnitude too slow.
+
+### 3. And it would not work even if it were fast
+
+A real encryptor opens, writes, and closes each file. The handle is gone by the time a
+detector could look for it. Probe: a writer creates 20 files, each closed immediately,
+then handles are enumerated at once.
+
+```
+writer pid=9960 wrote 20 files, each closed immediately
+written files still held open by anyone: 0 of 20
+attributable to the writer: 0 of 20
+```
+
+**Zero of twenty.** The workload that defeats the correlation heuristic defeats handle
+enumeration for the same underlying reason: the evidence does not exist at observation time.
+
+### What this means
+
+Per-process attribution for fast small-file workloads requires **an elevated deployment**.
+That is a deployment requirement, not a capability the detector has — and it should be
+stated as one.
+
+This is not a dead end; it changes what the claim is:
+
+- **Wrong:** "GRIMA attributes file writes to the process responsible."
+- **Right:** "GRIMA attributes file writes to the process responsible **when deployed with
+  the privileges ETW requires**; unelevated, it detects the same activity but cannot name
+  the actor."
+
+The second is defensible, testable, and honest. It also explains why the detector is
+designed so that detection does not *depend* on attribution — the file-derived signals
+(entropy, magic bytes, extension novelty) carry the verdict regardless.
+
+### To unblock
+
+1. **Run elevated.** Implement ETW consumption behind a build tag or a config flag, and
+   measure with an elevated detector. Only then can the ≥90% gate be tested at all.
+2. **Re-scope the gate.** If the deployment cannot be elevated, replace 1.4's ≥90% with a
+   stated bound: "per-process attribution is unavailable unelevated; tree-level attribution
+   is used instead." This is a legitimate re-scope, but it must be an explicit decision
+   recorded here, not a quietly lowered bar.
+
+Either way, **the gate stays failed until one of these is chosen.** Do not mark 1.4 complete
+on the strength of having measured the failure.
