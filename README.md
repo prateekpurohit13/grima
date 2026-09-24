@@ -6,8 +6,8 @@ APIs, folds that activity into per-process behavioral fingerprints over a rollin
 and scores each process against a **baseline calibrated on the host it runs on**.
 
 It is cross-platform by construction — one `Event` schema with per-OS adapters behind it —
-but **evaluation is limited to Windows**: the Linux and macOS adapters compile and have
-never been run on a real host. See [`docs/sprints.md`](docs/sprints.md) §10.
+and **verified on Windows and Linux** by CI. The macOS adapter ships but has never run on a
+real host, so macOS coverage is not claimed. See [`docs/sprints.md`](docs/sprints.md) §10.
 
 It does not install kernel drivers, does not require cgo, and does not use machine
 learning. Detection rests on deterministic, explainable signals: multi-signal heuristic

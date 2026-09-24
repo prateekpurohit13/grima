@@ -117,13 +117,12 @@ func Detect(cfg config.Config) (Set, error)
 
 | Host OS | FileWatch backend | ProcessWatch | PersistenceWatch | Status |
 |---|---|---|---|---|
-| Windows | `ReadDirectoryChangesW` (via fsnotify) | Windows API (via gopsutil) | Run/RunOnce keys, Scheduled Tasks, Startup folder | **Verified** — the only host exercised |
-| Linux | `inotify` (via fsnotify) | `/proc` (via gopsutil) | cron, systemd units, `/etc/rc*` | **Compiles, unverified** — no Linux host has been run |
-| macOS | `FSEvents` (via fsnotify) | `sysctl`/libproc (via gopsutil) | LaunchAgents, LaunchDaemons, cron | **Compiles, unverified** — Phase 7 |
+| Windows | `ReadDirectoryChangesW` (via fsnotify) | Windows API (via gopsutil) | Run/RunOnce keys, Scheduled Tasks, Startup folder | **Verified** — local runs and the `windows` CI job |
+| Linux | `inotify` (via fsnotify) | `/proc` (via gopsutil) | cron, systemd units, `/etc/rc*` | **Verified** — the `ubuntu` CI job runs `smoke-linux.sh` against a real kernel |
+| macOS | `FSEvents` (via fsnotify) | `sysctl`/libproc (via gopsutil) | LaunchAgents, LaunchDaemons, cron | **Compiles, unverified** — no macOS host has been run |
 
-"Compiles, unverified" is the honest state: the adapters exist and the code is written, but
-no event has ever been produced through them on that platform. Do not describe GRIMA as
-cross-platform without this qualifier — see `sprints.md` §10.
+macOS is the only unverified platform. Do not claim it from compilation alone — see
+`sprints.md` §10.
 
 The layer is a **factory, not a processing stage**: it holds no state, consumes no
 events, and its output is a slice of started sources. Drawing it as a peer of Layers

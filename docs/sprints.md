@@ -131,7 +131,7 @@ the sensors are accurate.
 | 1.5 | Attribution upgrade | 🟡 **IMPLEMENTED, UNMEASURED.** ETW was evaluated and rejected for this delivery; Windows file-system auditing (Security event 4663) is implemented behind a config flag, with correlation as the fallback, and unit-tested unelevated. One elevated run scores the gate: `testdata/scenarios/verify_attribution.ps1`. Evidence and reasoning in §14. |
 | 1.6 | Decoy touch fires | **Done.** `KindDecoyTouch` + `DecoyID` verified in unit tests and end to end at critical. |
 | 1.7 | Sensor health honesty | **Done.** `Reporting` on `sensor.Stats`; 5 tests over the `/healthz` shape a consumer parses. |
-| 1.8 | Linux smoke test | **Cut by decision** (§10). |
+| 1.8 | Linux smoke test | ✅ **Done, via CI instead of WSL.** The ubuntu job runs `smoke-linux.sh`: all three sensors report, `filewatch` produces events, `persistwatch` scans real locations, the benign workload stays silent, and the encryptor is detected with content-derived signals. Reproducible by anyone — see §10. |
 
 **Audit result.** An independent review of the sprint found two blocker-class defects, both
 now fixed:
@@ -288,7 +288,7 @@ Cut from the top when time is short. **Sprint 4 is never cut.**
 | Order | Cut | Cost of cutting |
 |---|---|---|
 | 1 | Dashboard features beyond the current view | None — the demo still works |
-| 2 | Non-Windows sensor verification (Linux, macOS) | **Already cut.** Scope statement required: "verified on Windows"; cross-platform remains a design property, not a measured one |
+| 2 | macOS sensor verification | Scope statement required: verified on Windows and Linux; macOS coverage not claimed |
 | 3 | Alert throttling (3.4) | Log noise during an incident |
 | 4 | Suspend path (3.2) | Observe-only; defensible, since suspend is opt-in anyway |
 | 5 | Generalization split (4.5) | Weakens the headline claim — cut only under real pressure |
@@ -307,49 +307,51 @@ Verified against the code, not assumed:
 | ~~Decoy touch never observed firing~~ | **Resolved in Sprint 1** — verified in unit tests and end to end at critical | Done |
 | **Suspend path untested** | Implemented for Windows and POSIX, never executed | Sprint 3 item 3.2 |
 | ~~Overflow rescan untested~~ | **Resolved in Sprint 1** — 6 tests, revert-checked so the test fails if the rescan call is removed | Done |
-| **Non-Windows hosts unverified** | All verification ran on Windows. Linux and macOS adapters compile but have never observed a real event | Scope statement in the paper; see §10 |
+| **macOS unverified** | The adapter compiles but no macOS host has produced an event through it | Scope statement in the paper; see §10 |
 | **`static_reputation` signal absent** | Documented as Phase 7; correctly marked "not yet emitted" in `design.md` §5 | Buffer or never |
 
 ---
 
-## 10. What Dropping Linux Costs
+## 10. Platform Verification
 
-Linux verification was cut by decision. This section records the consequence so it is not
-discovered during the viva.
+**Superseded — Linux is verified.** This section originally recorded the cost of cutting
+Linux verification: cross-platform would be a design property rather than a measured one, and
+Gap 1 could not be claimed as closed. That position no longer holds.
 
-**What is still true.** The platform dispatch layer exists, the per-OS adapters compile for
-Linux and macOS, and `CGO_ENABLED=0 GOOS=linux go build` produces a static binary. The
-architecture is genuinely cross-platform by construction.
+Linux verification was reinstated through a different mechanism than the one originally
+planned. Rather than WSL or a container, the project uses **GitHub Actions on
+`ubuntu-latest`** — a real Ubuntu VM with a real kernel. The `linux` job runs
+`smoke-linux.sh`, which asserts:
 
-**What is no longer true.** *Cross-platform is a design property, not a measured one.* No
-Linux or macOS host has ever produced an event through this code. Nothing in the evaluation
-can support a claim that the system works on a second platform.
+- all three sensors register and report counters;
+- `filewatch` produces real `inotify` events;
+- `persistwatch` scans real cron and systemd locations;
+- the benign workload stays silent;
+- the encryptor is detected with content-derived signals;
+- the binary is statically linked.
 
-**The cost lands on Gap 1.** Gap 1 — "lack of cohesive cross-platform implementations" — is
-the first gap the paper identifies, and the project's answer to it was a user-space design
-plus a platform-dispatch layer. With Linux unverified, the paper can claim:
+**Linux is now measured, not asserted.** The claim the paper can make is correspondingly
+stronger:
 
-> The architecture avoids OS lock-in by construction and ships adapters for Linux and macOS,
-> but evaluation is limited to Windows. Cross-platform efficacy is unmeasured.
+> The architecture avoids OS lock-in by construction, and is verified on Windows and Linux.
+> macOS adapters ship but remain unverified.
 
-It **cannot** claim the gap is closed. Stating it as closed would be a claim about a system
-nobody has run on the platform in question.
+The value of this is not only the second data point. The first CI run **failed on Linux and
+passed on Windows on the same commit**, exposing a design defect that would have gone
+unnoticed: `fingerprint.Apply` discarded every file event it could not attribute to a
+process, so the detector went blind wherever attribution returned zero. A single-platform
+evaluation cannot find that class of bug. See §13.
 
-**Where this must be said:**
-1. `README.md` — the cross-platform claim must be qualified where it appears.
-2. `plan.md` §5 — the Gap 1 row must stop reading as "addressed" and start reading as
-   "addressed by design, unverified in evaluation".
-3. `plan.md` §9 Non-Goals — non-Windows verification belongs there.
-4. The paper's Threats to Validity section — as a first-class limitation, not a footnote.
-5. `architecture.md` §3 — the platform table must mark Linux and macOS as unverified.
+**What remains unverified: macOS.** The `darwin` adapter compiles and ships, but no macOS
+host has produced an event through it. `architecture.md` §3 marks it accordingly, and the
+paper's Threats to Validity must say so.
 
-**What would restore the claim.** Item 1.8 as originally written: cross-compile, run against
-a native filesystem, confirm `filewatch` produces events and `persistwatch` scans cron and
-systemd. Roughly half a sprint. It is the cheapest gap to recover and the most expensive to
-leave unstated.
+**Still true from the original reasoning:**
 
-**Do not** describe the system as cross-platform in the abstract without the qualifier. A
-reviewer who notices the claim is unevidenced will discount everything else in the paper.
+1. `README.md` must not describe the system as cross-platform without naming which platforms
+   are verified.
+2. The paper's Threats to Validity section carries macOS as a first-class limitation.
+3. Do not claim macOS coverage from compilation alone.
 
 ---
 

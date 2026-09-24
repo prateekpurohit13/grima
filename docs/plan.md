@@ -165,7 +165,7 @@ it is a mapping, not a novelty claim.
 
 | Gap | Description (from the literature) | GRIMA mechanism | ML needed? |
 |---|---|---|---|
-| 1 | Lack of cohesive cross-platform implementations; Windows-centric kernel tooling creates security silos | Platform dispatch layer + per-OS sensor adapters behind one `Event` schema; pure Go cross-compilation. **Addressed by design; unverified in evaluation** — Linux and macOS adapters compile but have never run on a real host (see `sprints.md` §10) | No |
+| 1 | Lack of cohesive cross-platform implementations; Windows-centric kernel tooling creates security silos | Platform dispatch layer + per-OS sensor adapters behind one `Event` schema; pure Go cross-compilation. **Verified on Windows and Linux in CI**; the macOS adapter ships but is unverified (see `sprints.md` §10) | No |
 | 2 | Multi-process workload splitting blinds per-process classifiers | Tree aggregator sums fingerprints over the ancestor/process group before scoring | No |
 | 3 | Methodological silos and single-threshold evasion (e.g. entropy alone, which 7-Zip defeats) | 13-signal fusion; rule overrides set a floor; entropy is conditioned on per-extension priors and paired with magic-byte checks | No |
 | 4 | Rigid time-based thresholding fails against wait-timers and drip encryption | Dual-track accumulation: decaying window **plus** non-decaying cumulative counters | No |
@@ -276,9 +276,9 @@ thing to cut, not the harness.
 - **Machine learning.** See Decision §1.
 - **macOS in Phases 0–6.** Cross-compilation is supported from Phase 0; the macOS
   sensor set lands in Phase 7.
-- **Non-Windows verification.** Linux and macOS adapters are written and compile, but no
-  non-Windows host has been exercised. Cross-platform is a design property, not a measured
-  one; see `sprints.md` §10 for what this costs and how to restore it.
+- **macOS verification.** The adapter is written and compiles, but no macOS host has been
+  exercised. Windows and Linux are verified in CI; macOS coverage is not claimed. See
+  `sprints.md` §10.
 
 ---
 

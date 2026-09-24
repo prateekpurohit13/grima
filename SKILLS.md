@@ -56,8 +56,8 @@ dropped, verdicts emitted.
 ## 2. Cross-compile for another platform
 
 **Cross-compiling is not verification.** It proves the code builds for that platform, not
-that the sensors observe anything there. No non-Windows host has been run; see
-`docs/sprints.md` §10.
+that the sensors observe anything there. Windows and Linux are verified by the CI workflow;
+**macOS is not** — see `docs/sprints.md` §10.
 
 ```sh
 make cross
