@@ -109,11 +109,14 @@ func (e *Engine) Aggregate(root int32) TreeVector {
 
 	tv := TreeVector{
 		Root:           root,
-		Dirs:           make(map[string]struct{}),
 		ExtActivity:    make(map[string]int64),
 		WindowDuration: e.cfg.Window.DecayHalfLife.Std(),
 	}
 
+	// One accumulator for the whole tree: the members' in-window samples form a
+	// single sequence, so the n-gram feature sees the tree's behavior rather
+	// than one process's.
+	c := newCounts()
 	e.walk(root, func(pid int32, p *procState) {
 		tv.PIDs = append(tv.PIDs, pid)
 		if tv.ProcName == "" {
@@ -125,7 +128,6 @@ func (e *Engine) Aggregate(root int32) TreeVector {
 			tv.ExtActivity[ext] += n
 		}
 
-		c := newCounts()
 		p.each(func(s sample) bool {
 			if s.at.Before(cutoff) {
 				return false // newest-first, so everything after this is older
@@ -133,19 +135,19 @@ func (e *Engine) Aggregate(root int32) TreeVector {
 			c.add(s)
 			return true
 		})
-
-		tv.Writes += c.writes
-		tv.Creates += c.creates
-		tv.Renames += c.renames
-		tv.Deletes += c.deletes
-		tv.Bytes += c.bytes
-		tv.MagicTotal += c.magicAll
-		tv.MagicMismatch += c.magicBad
-		tv.Entropy = append(tv.Entropy, c.entropy...)
-		for dir := range c.dirs {
-			tv.Dirs[dir] = struct{}{}
-		}
 	})
+	c.finish()
+
+	tv.Writes = c.writes
+	tv.Creates = c.creates
+	tv.Renames = c.renames
+	tv.Deletes = c.deletes
+	tv.Bytes = c.bytes
+	tv.Dirs = c.dirs
+	tv.Entropy = c.entropy
+	tv.MagicTotal = c.magicAll
+	tv.MagicMismatch = c.magicBad
+	tv.NGram = c.ngram(e.cfg.Window.NGramLength)
 
 	return tv
 }
@@ -230,6 +232,7 @@ func (e *Engine) snapshot(p *procState, now time.Time) Window {
 		c.add(s)
 		return true
 	})
+	c.finish()
 
 	w := Window{
 		Writes:            c.writes,
@@ -241,6 +244,7 @@ func (e *Engine) snapshot(p *procState, now time.Time) Window {
 		Entropy:           c.entropy,
 		MagicTotal:        c.magicAll,
 		MagicMismatch:     c.magicBad,
+		NGram:             c.ngram(e.cfg.Window.NGramLength),
 		CumFilesRewritten: p.cumFilesRewritten,
 		CumBytesRewritten: p.cumBytesRewritten,
 		ExtActivity:       make(map[string]int64, len(p.extActivity)),

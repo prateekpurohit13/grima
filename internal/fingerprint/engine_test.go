@@ -187,3 +187,246 @@ func TestWindowMissingProcessReportsNotOK(t *testing.T) {
 		t.Fatal("expected not-ok for an unknown process")
 	}
 }
+
+func rename(pid int32, path string, at time.Time) event.Event {
+	return event.Event{Kind: event.KindFileRename, PID: pid, Path: path, Time: at}
+}
+
+// An encryptor overwrites a file and renames it to a new extension, so its
+// window is a run of write-then-rename chains. That is what the n-gram feature
+// has to see, and what the signal reads.
+func TestNGramReadsWriteToRenameChains(t *testing.T) {
+	cfg := config.Default()
+	cfg.Window.DecayHalfLife = config.Duration(time.Hour)
+	cfg.Window.NGramLength = 4
+	e := NewEngine(cfg)
+	now := time.Now()
+
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 8, ProcName: "cryptor", Time: now})
+	for i := range 10 {
+		e.Apply(write(8, fmt.Sprintf("/data/doc%d.txt", i), 100, now))
+		e.Apply(rename(8, fmt.Sprintf("/data/doc%d.txt", i), now))
+	}
+
+	ng := e.Aggregate(8).NGram
+	if ng.K != 4 {
+		t.Fatalf("k = %d, want 4 from window.ngram_length", ng.K)
+	}
+	if ng.Total != 17 {
+		t.Fatalf("k-grams = %d, want 17 from 20 events", ng.Total)
+	}
+	if ng.RenameChains != 17 || ng.ChainShare != 1 {
+		t.Fatalf("chains = %d of %d (share %.2f), want every k-gram to hold a write>rename chain",
+			ng.RenameChains, ng.Total, ng.ChainShare)
+	}
+	if ng.Count != 9 {
+		t.Fatalf("dominant k-gram count = %d, want 9", ng.Count)
+	}
+	if ng.Sequence != "file_write>file_rename" {
+		t.Fatalf("dominant k-gram = %q, want %q", ng.Sequence, "file_write>file_rename")
+	}
+
+	win, ok := e.Window(8)
+	if !ok || win.NGram != ng {
+		t.Fatalf("window n-gram %+v disagrees with aggregate %+v", win.NGram, ng)
+	}
+}
+
+// Sad path: a rename that no write precedes is not an encrypt-then-rename chain.
+// Compilers, archive tools and installers create and rename files constantly;
+// counting those would make the signal noise.
+func TestNGramCountsOnlyRenamesThatFollowAWrite(t *testing.T) {
+	cfg := config.Default()
+	cfg.Window.DecayHalfLife = config.Duration(time.Hour)
+	cfg.Window.NGramLength = 4
+	e := NewEngine(cfg)
+	now := time.Now()
+
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 9, ProcName: "installer", Time: now})
+	for i := range 10 {
+		e.Apply(event.Event{Kind: event.KindFileCreate, PID: 9, Path: fmt.Sprintf("/data/tmp%d", i), Time: now})
+		e.Apply(rename(9, fmt.Sprintf("/data/tmp%d", i), now))
+	}
+	if ng := e.Aggregate(9).NGram; ng.RenameChains != 0 || ng.ChainShare != 0 {
+		t.Fatalf("create-then-rename counted as a chain: %d of %d", ng.RenameChains, ng.Total)
+	}
+
+	// A plain bulk writer is one repeated kind, and no chain at all.
+	e2 := NewEngine(cfg)
+	e2.Apply(event.Event{Kind: event.KindProcessStart, PID: 10, ProcName: "backup", Time: now})
+	for i := range 10 {
+		e2.Apply(write(10, fmt.Sprintf("/data/f%d.txt", i), 10, now))
+	}
+	ng := e2.Aggregate(10).NGram
+	if ng.RenameChains != 0 {
+		t.Fatalf("write-only window reported %d chains", ng.RenameChains)
+	}
+	if ng.Sequence != "file_write" {
+		t.Fatalf("dominant k-gram = %q, want %q", ng.Sequence, "file_write")
+	}
+}
+
+// A k of 1 is a legal configuration, and a one-event sequence holds no
+// transition, so no chain can be counted.
+func TestNGramOneGramHoldsNoTransition(t *testing.T) {
+	cfg := config.Default()
+	cfg.Window.DecayHalfLife = config.Duration(time.Hour)
+	cfg.Window.NGramLength = 1
+	e := NewEngine(cfg)
+	now := time.Now()
+
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 12, ProcName: "pair", Time: now})
+	for i := range 10 {
+		e.Apply(write(12, fmt.Sprintf("/data/f%d.txt", i), 10, now))
+		e.Apply(rename(12, fmt.Sprintf("/data/f%d.txt", i), now))
+	}
+
+	ng := e.Aggregate(12).NGram
+	if ng.Total != 20 {
+		t.Fatalf("1-grams = %d, want 20", ng.Total)
+	}
+	if ng.RenameChains != 0 || ng.ChainShare != 0 {
+		t.Fatalf("1-grams reported %d chains", ng.RenameChains)
+	}
+}
+
+// Sad path: fewer events than k is not an observation of zero chains, it is no
+// observation at all. The two must be distinguishable, or a quiet process looks
+// like a benign one.
+func TestNGramIsAbsentWhenTheWindowIsShorterThanK(t *testing.T) {
+	e := testEngine(t, time.Hour)
+	now := time.Now()
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 11, ProcName: "quiet", Time: now})
+	for i := range 3 {
+		e.Apply(write(11, fmt.Sprintf("/data/f%d.txt", i), 10, now))
+	}
+
+	ng := e.Aggregate(11).NGram
+	if ng.Total != 0 || ng.RenameChains != 0 || ng.Sequence != "" {
+		t.Fatalf("3 events produced an n-gram: %+v", ng)
+	}
+	if ng.K != 32 {
+		t.Fatalf("k = %d, want the configured 32 so an unobserved window is explainable", ng.K)
+	}
+}
+
+// A split workload has no chain in any one process, but its members' sequences
+// concatenate at tree level — the same reasoning that makes the summed counters
+// catch a split.
+func TestTreeNGramSpansChildren(t *testing.T) {
+	e := testEngine(t, time.Hour)
+	now := time.Now()
+
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 30, ProcName: "parent", Time: now})
+	e.Apply(write(30, "/data/parent.txt", 10, now))
+	for pid := int32(31); pid <= 32; pid++ {
+		e.Apply(event.Event{Kind: event.KindProcessStart, PID: pid, PPID: 30, ProcName: "worker", Time: now})
+		for i := range 20 {
+			e.Apply(write(pid, fmt.Sprintf("/data/child%d_%d.txt", pid, i), 10, now))
+			e.Apply(rename(pid, fmt.Sprintf("/data/child%d_%d.txt", pid, i), now))
+		}
+	}
+
+	if child := e.Aggregate(31).NGram; child.RenameChains != child.Total {
+		t.Fatalf("child chains = %d of %d, want all", child.RenameChains, child.Total)
+	}
+	tree := e.Aggregate(30).NGram
+	if tree.RenameChains != tree.Total || tree.Total == 0 {
+		t.Fatalf("tree chains = %d of %d, want the children's chains to survive aggregation",
+			tree.RenameChains, tree.Total)
+	}
+}
+
+// 2.7: samples live in a fixed-capacity ring, so a long-running process retains
+// the newest ringCapacity events and nothing older. The oldest samples must be
+// gone, and the counters must stop growing at the cap.
+func TestRingWrapDropsOldestSamples(t *testing.T) {
+	cfg := config.Default()
+	cfg.Window.DecayHalfLife = config.Duration(time.Hour)
+	e := NewEngine(cfg)
+	now := time.Now()
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 42, ProcName: "looper", Time: now})
+
+	for range 64 { // oldest: these slots get overwritten
+		e.Apply(event.Event{Kind: event.KindFileDelete, PID: 42, Path: "/data/ancient/old.txt", Time: now})
+	}
+	for i := range ringCapacity {
+		e.Apply(write(42, fmt.Sprintf("/data/bulk/f%d.txt", i), 10, now))
+	}
+
+	win, ok := e.Window(42)
+	if !ok {
+		t.Fatal("process vanished while it was still live")
+	}
+	if win.Deletes != 0 {
+		t.Fatalf("deletes = %d, want 0: the 64 oldest samples must be gone", win.Deletes)
+	}
+	if win.Writes != ringCapacity {
+		t.Fatalf("writes = %d, want the ring capped at %d, not %d",
+			win.Writes, ringCapacity, ringCapacity+64)
+	}
+	if len(win.Dirs) != 1 {
+		t.Fatalf("directories = %d, want 1 (/data/bulk only)", len(win.Dirs))
+	}
+	if want := ringCapacity - cfg.Window.NGramLength + 1; win.NGram.Total != want {
+		t.Fatalf("n-gram input = %d events, want %d: the sequence must be bounded by the ring too",
+			win.NGram.Total, want)
+	}
+	if e.Live() != 1 {
+		t.Fatalf("live = %d, want 1", e.Live())
+	}
+}
+
+// 2.7: memory tracks live processes. Reaping on exit has to return the count to
+// zero across many start/exit cycles, including when the operating system reuses
+// the same PID.
+func TestProcessExitReleasesStateAcrossManyCycles(t *testing.T) {
+	e := testEngine(t, time.Hour)
+	now := time.Now()
+
+	for cycle := range 500 {
+		for pid := int32(1); pid <= 20; pid++ {
+			e.Apply(event.Event{Kind: event.KindProcessStart, PID: pid, ProcName: "worker", Time: now})
+			e.Apply(write(pid, fmt.Sprintf("/data/f%d.txt", pid), 4096, now))
+			e.Apply(event.Event{Kind: event.KindProcessExit, PID: pid, Time: now})
+		}
+		if e.Live() != 0 {
+			t.Fatalf("cycle %d: live = %d, want 0 once every process has exited", cycle, e.Live())
+		}
+	}
+	if e.Live() != 0 || len(e.Roots()) != 0 {
+		t.Fatalf("live = %d, roots = %v, want both empty", e.Live(), e.Roots())
+	}
+}
+
+// A re-created PID starts from empty state: the old fingerprint was released,
+// not accumulated.
+func TestRecreatedProcessStartsFromEmpty(t *testing.T) {
+	e := testEngine(t, time.Hour)
+	now := time.Now()
+
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 77, ProcName: "first", Time: now})
+	for i := range 3 {
+		e.Apply(write(77, fmt.Sprintf("/data/old%d.txt", i), 100, now))
+	}
+	e.Apply(event.Event{Kind: event.KindProcessExit, PID: 77, Time: now})
+	if e.Live() != 0 {
+		t.Fatalf("live = %d after exit, want 0", e.Live())
+	}
+
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 77, ProcName: "second", Time: now})
+	e.Apply(write(77, "/data/new.txt", 7, now))
+
+	tv := e.Aggregate(77)
+	if tv.Writes != 1 || tv.Bytes != 7 {
+		t.Fatalf("re-created process carries %d writes / %d bytes, want 1 / 7",
+			tv.Writes, tv.Bytes)
+	}
+	if tv.CumFilesRewritten != 1 {
+		t.Fatalf("cumulative files = %d, want 1: the previous incarnation's counters must be gone",
+			tv.CumFilesRewritten)
+	}
+	if tv.ProcName != "second" {
+		t.Fatalf("name = %q, want the new incarnation's name", tv.ProcName)
+	}
+}

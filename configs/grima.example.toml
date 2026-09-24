@@ -67,6 +67,8 @@ count_per_dir = 2
 # Decay for the burst track. The cumulative track never decays, which is what
 # catches slow drip encryption.
 decay_half_life = "30s"
+# Length of the event-kind n-gram read from each window. The share of k-grams
+# holding a write followed by a rename is signal `ngram_rename_chain`.
 ngram_length = 32
 
 [calibration]
@@ -103,6 +105,12 @@ weight = 1.0
 [[scoring.weights]]
 name = "rename_burst"
 weight = 0.8
+# The fraction of the window's event-kind n-grams that hold a write followed by
+# a rename, the sequence an encryptor produces when it writes a file and renames
+# it to a new extension. k is window.ngram_length.
+[[scoring.weights]]
+name = "ngram_rename_chain"
+weight = 0.5
 [[scoring.weights]]
 name = "unknown_extension_activity"
 weight = 1.0

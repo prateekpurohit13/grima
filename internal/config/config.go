@@ -171,6 +171,7 @@ var DefaultSignalWeights = []Weight{
 	{Name: "write_burst", Weight: 1.0},
 	{Name: "write_rate_absolute", Weight: 1.0},
 	{Name: "rename_burst", Weight: 0.8},
+	{Name: "ngram_rename_chain", Weight: 0.5},
 	{Name: "unknown_extension_activity", Weight: 1.0},
 	{Name: "delete_rate", Weight: 0.5},
 	{Name: "dir_fanout", Weight: 0.5},

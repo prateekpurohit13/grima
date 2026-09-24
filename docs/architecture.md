@@ -239,6 +239,7 @@ type Window struct {
     Entropy       []EntropySample
     MagicTotal    int
     MagicMismatch int
+    NGram         NGram
 
     // Non-decaying track — slow-and-low detection
     CumFilesRewritten int64
@@ -255,18 +256,27 @@ The cumulative track never decays, so sustained low-rate encryption eventually c
 a threshold that no single window would reach. Decay and accumulation answer different
 questions and both are required.
 
-### N-gram ring — not implemented
+### N-gram ring
 
-An event-type n-gram (`write, write, rename, delete, write…`) would be a useful
-discriminator between encryption and ordinary editing, and `window.ngram_length` exists
-in configuration. **No n-gram feature is computed and no n-gram signal is emitted.** The
-config key is dead.
+Because the ring records each event's `Kind`, a window is also a sequence of event kinds.
+`NGram` reports the most frequent $k$-gram ($k = \texttt{window.ngram\_length}$) and the
+share of k-grams that contain a `file_write → file_rename` transition: the shape an
+encryptor has, because it overwrites a file and renames it to a new extension, and the one
+a compiler, archiver or backup does not, because they write without renaming. A
+`file_create → file_rename` pair is deliberately not counted — installers and editors do
+that constantly.
 
-The raw material is present — the sample ring records each event's `Kind` — but nothing
-derives a sequence feature from it. Tracked as sprint item 2.1: implement it and emit a
-signal, or delete the claim and the config key.
+Only samples inside `decay_half_life` are read, so this stays on the decaying track, and
+the sequence is bounded by the ring, so the feature retains no state of its own. The tree
+aggregate reads its members' samples as one sequence, so a split workload's shape survives
+rather than being lost between children.
 
-Until then, treat the n-gram as absent, and do not cite it as a signal in the paper.
+It is emitted as signal #14, `ngram_rename_chain` (Secondary, no baseline input): a window
+shorter than $k$ events produces no signal at all, which is not the same as a window with
+no chains. The shape is not unique to ransomware — an extractor or an atomic-save editor
+writes and renames too — so the weight is a starting point for the evaluation harness, not
+a calibrated constant. This closes the gap §9 of the sprint plan carried into Sprint 2: the
+config key is read, and the signal reaches verdicts.
 
 ---
 

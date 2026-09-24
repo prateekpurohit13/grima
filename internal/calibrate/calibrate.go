@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -87,21 +88,138 @@ func (b *Baseline) KnowsExt(ext string) bool {
 	return false
 }
 
+// Observations accumulates the measurements a baseline is assembled from.
+// Capture and Recalibrate both measure through it, so a recalibration window and
+// a first capture reduce to comparable numbers.
+type Observations struct {
+	entropyByExt map[string][]float64
+	writeCounts  map[string]int
+	dirSets      map[string]map[string]struct{}
+	perSecond    map[int64]int
+	extSeen      map[string]struct{}
+}
+
+// NewObservations returns an empty measurement set.
+func NewObservations() *Observations {
+	return &Observations{
+		entropyByExt: make(map[string][]float64),
+		writeCounts:  make(map[string]int),
+		dirSets:      make(map[string]map[string]struct{}),
+		perSecond:    make(map[int64]int),
+		extSeen:      make(map[string]struct{}),
+	}
+}
+
+// Observe folds one bus event into the measurement set.
+func (o *Observations) Observe(ev event.Event) {
+	if o.entropyByExt == nil {
+		*o = *NewObservations()
+	}
+
+	o.perSecond[ev.Time.Unix()]++
+	if ext := ev.Extension(); ext != "" {
+		o.extSeen[ext] = struct{}{}
+	}
+	if ev.Kind != event.KindFileWrite {
+		return
+	}
+	if ev.Entropy > 0 {
+		if ext := ev.Extension(); ext != "" {
+			o.entropyByExt[ext] = append(o.entropyByExt[ext], ev.Entropy)
+		}
+	}
+	// An unattributed write still carries entropy and an extension, but it
+	// cannot be charged to a process name.
+	if ev.PID == 0 || ev.ProcName == "" {
+		return
+	}
+	o.writeCounts[ev.ProcName]++
+	dirs := o.dirSets[ev.ProcName]
+	if dirs == nil {
+		dirs = make(map[string]struct{})
+		o.dirSets[ev.ProcName] = dirs
+	}
+	if d := event.ParentDir(ev.Path); d != "" {
+		dirs[d] = struct{}{}
+	}
+}
+
+// Baseline assembles the measured distributions. elapsed is the observation
+// window the counts were gathered over; a non-positive window falls back to the
+// configured warm-up so that a rate is never divided by zero.
+func (o *Observations) Baseline(cfg config.Config, elapsed time.Duration) *Baseline {
+	seconds := elapsed.Seconds()
+	if seconds <= 0 {
+		seconds = cfg.Calibration.Warmup.Std().Seconds()
+	}
+	if seconds <= 0 {
+		seconds = 1
+	}
+
+	bl := &Baseline{
+		Version:         Version,
+		CapturedAt:      time.Now(),
+		WarmupSeconds:   seconds,
+		MinSamples:      cfg.Calibration.MinSamples,
+		SigmaFloor:      cfg.Calibration.EntropySigmaFloor,
+		EntropyByExt:    make(map[string]Dist, len(o.entropyByExt)),
+		WriteRateByProc: make(map[string]float64, len(o.writeCounts)),
+	}
+	if host, err := os.Hostname(); err == nil {
+		bl.Host = host
+	}
+
+	for ext, samples := range o.entropyByExt {
+		bl.EntropyByExt[ext] = distOf(samples)
+	}
+
+	for name, n := range o.writeCounts {
+		bl.WriteRateByProc[name] = float64(n) / seconds
+	}
+
+	fanouts := make([]float64, 0, len(o.dirSets))
+	for _, dirs := range o.dirSets {
+		fanouts = append(fanouts, float64(len(dirs)))
+	}
+	bl.DirFanout = distOf(fanouts)
+
+	rates := make([]float64, 0, len(o.perSecond))
+	for _, n := range o.perSecond {
+		rates = append(rates, float64(n))
+	}
+	bl.HostEventRate = distOf(rates)
+
+	known := make(map[string]struct{}, len(o.extSeen))
+	for ext := range o.extSeen {
+		known[ext] = struct{}{}
+	}
+	// Extensions that already exist under the monitored paths are "known" even
+	// if nothing wrote to them during the observation window.
+	for _, ext := range scanExtensions(cfg.General.MonitorPaths) {
+		known[ext] = struct{}{}
+	}
+	for ext := range known {
+		bl.KnownExt = append(bl.KnownExt, ext)
+	}
+	sort.Strings(bl.KnownExt)
+
+	return bl
+}
+
+// distOf reduces raw samples to a distribution.
+func distOf(xs []float64) Dist {
+	mean, sd := meanStdDev(xs)
+	return Dist{Mean: mean, StdDev: sd, N: len(xs)}
+}
+
 // Capture observes the host for the configured warm-up period and returns the
 // measured baseline.
 func Capture(ctx context.Context, cfg config.Config, b *bus.Bus) (*Baseline, error) {
 	ch := b.Subscribe("calibration", 16384)
-
-	entropyByExt := make(map[string][]float64)
-	writeCounts := make(map[string]int)
-	dirSets := make(map[string]map[string]struct{})
-	perSecond := make(map[int64]int)
-	totalEvents := 0
-	extSeen := make(map[string]struct{})
+	obs := NewObservations()
 
 	start := time.Now()
-	warmup := cfg.Calibration.Warmup.Std()
-	timer := time.NewTimer(warmup)
+	timer := time.NewTimer(cfg.Calibration.Warmup.Std())
 	defer timer.Stop()
 
 collect:
@@ -115,86 +233,11 @@ collect:
 			if !ok {
 				break collect
 			}
-			totalEvents++
-			perSecond[ev.Time.Unix()]++
-
-			if ev.Extension() != "" {
-				extSeen[ev.Extension()] = struct{}{}
-			}
-			if ev.Kind != event.KindFileWrite {
-				continue
-			}
-			if ev.Entropy > 0 && ev.Extension() != "" {
-				entropyByExt[ev.Extension()] = append(entropyByExt[ev.Extension()], ev.Entropy)
-			}
-			if ev.PID == 0 || ev.ProcName == "" {
-				continue
-			}
-			writeCounts[ev.ProcName]++
-			dirs := dirSets[ev.ProcName]
-			if dirs == nil {
-				dirs = make(map[string]struct{})
-				dirSets[ev.ProcName] = dirs
-			}
-			if d := event.ParentDir(ev.Path); d != "" {
-				dirs[d] = struct{}{}
-			}
+			obs.Observe(ev)
 		}
 	}
 
-	elapsed := time.Since(start).Seconds()
-	if elapsed <= 0 {
-		elapsed = warmup.Seconds()
-	}
-
-	bl := &Baseline{
-		Version:         Version,
-		CapturedAt:      time.Now(),
-		WarmupSeconds:   elapsed,
-		MinSamples:      cfg.Calibration.MinSamples,
-		SigmaFloor:      cfg.Calibration.EntropySigmaFloor,
-		EntropyByExt:    make(map[string]Dist, len(entropyByExt)),
-		WriteRateByProc: make(map[string]float64, len(writeCounts)),
-	}
-	if host, err := os.Hostname(); err == nil {
-		bl.Host = host
-	}
-
-	for ext, samples := range entropyByExt {
-		mean, sd := meanStdDev(samples)
-		bl.EntropyByExt[ext] = Dist{Mean: mean, StdDev: sd, N: len(samples)}
-	}
-
-	for name, n := range writeCounts {
-		bl.WriteRateByProc[name] = float64(n) / elapsed
-	}
-
-	fanouts := make([]float64, 0, len(dirSets))
-	for _, dirs := range dirSets {
-		fanouts = append(fanouts, float64(len(dirs)))
-	}
-	mean, sd := meanStdDev(fanouts)
-	bl.DirFanout = Dist{Mean: mean, StdDev: sd, N: len(fanouts)}
-
-	rates := make([]float64, 0, len(perSecond))
-	for _, n := range perSecond {
-		rates = append(rates, float64(n))
-	}
-	mean, sd = meanStdDev(rates)
-	bl.HostEventRate = Dist{Mean: mean, StdDev: sd, N: len(rates)}
-
-	for ext := range extSeen {
-		bl.KnownExt = append(bl.KnownExt, ext)
-	}
-	// Extensions that already exist under the monitored paths are "known" even
-	// if nothing wrote to them during the warm-up.
-	for _, ext := range scanExtensions(cfg.General.MonitorPaths) {
-		if _, ok := extSeen[ext]; !ok {
-			bl.KnownExt = append(bl.KnownExt, ext)
-		}
-	}
-
-	return bl, nil
+	return obs.Baseline(cfg, time.Since(start)), nil
 }
 
 // Save writes the baseline as JSON.
@@ -235,6 +278,127 @@ func Load(path string) (*Baseline, error) {
 		return nil, nil
 	}
 	return &b, nil
+}
+
+// Merge folds a fresh measurement set into b and returns the number of
+// extensions that were not previously known. This is the recalibration edge:
+// the confirmed-benign observations become part of the distributions the
+// signals are measured against, so a workload the operator has marked benign
+// stops registering as a deviation.
+//
+// b keeps its own settings — MinSamples and SigmaFloor describe the deployment,
+// not the measurements — while CapturedAt becomes the time of this refresh, so
+// the dashboard's calibration age tracks the newest data.
+func (b *Baseline) Merge(fresh *Baseline) (int, error) {
+	if b == nil || fresh == nil {
+		return 0, fmt.Errorf("merge needs two baselines")
+	}
+	// The baseline is host-specific by construction; folding another host's
+	// measurements in would silently describe a machine that does not exist.
+	if b.Host != "" && fresh.Host != "" && b.Host != fresh.Host {
+		return 0, fmt.Errorf("baseline describes host %s, observations come from %s", b.Host, fresh.Host)
+	}
+	if b.EntropyByExt == nil {
+		b.EntropyByExt = make(map[string]Dist)
+	}
+	if b.WriteRateByProc == nil {
+		b.WriteRateByProc = make(map[string]float64)
+	}
+
+	for ext, d := range fresh.EntropyByExt {
+		b.EntropyByExt[ext] = poolDist(b.EntropyByExt[ext], d)
+	}
+
+	// A rate is counts over time, so a known process is re-averaged over the
+	// total observation time: neither window may be dropped, or the baseline
+	// would drift toward whichever was measured last. A process the baseline
+	// has never recorded has no prior rate to average with — it is new, and
+	// treating its absence as a zero rate would understate it permanently.
+	total := b.WarmupSeconds + fresh.WarmupSeconds
+	for name, rate := range fresh.WriteRateByProc {
+		prior, known := b.WriteRateByProc[name]
+		if !known || b.WarmupSeconds <= 0 || fresh.WarmupSeconds <= 0 {
+			b.WriteRateByProc[name] = rate
+			continue
+		}
+		b.WriteRateByProc[name] = (prior*b.WarmupSeconds + rate*fresh.WarmupSeconds) / total
+	}
+	b.WarmupSeconds = total
+
+	b.HostEventRate = poolDist(b.HostEventRate, fresh.HostEventRate)
+	b.DirFanout = poolDist(b.DirFanout, fresh.DirFanout)
+
+	known := make(map[string]struct{}, len(b.KnownExt))
+	for _, ext := range b.KnownExt {
+		known[ext] = struct{}{}
+	}
+	promoted := 0
+	for _, ext := range fresh.KnownExt {
+		if _, ok := known[ext]; ok {
+			continue
+		}
+		known[ext] = struct{}{}
+		b.KnownExt = append(b.KnownExt, ext)
+		promoted++
+	}
+	sort.Strings(b.KnownExt)
+
+	if b.Host == "" {
+		b.Host = fresh.Host
+	}
+	b.CapturedAt = time.Now()
+	return promoted, nil
+}
+
+// poolDist combines two measured distributions, weighting each by its sample
+// count and adding the variance the two means differ by.
+func poolDist(a, c Dist) Dist {
+	if a.N <= 0 {
+		return c
+	}
+	if c.N <= 0 {
+		return a
+	}
+
+	n := a.N + c.N
+	mean := (a.Mean*float64(a.N) + c.Mean*float64(c.N)) / float64(n)
+
+	// Sum of squared deviations: each group's own scatter, plus the scatter
+	// their means introduce around the pooled mean.
+	sq := a.StdDev * a.StdDev * float64(a.N-1)
+	sq += c.StdDev * c.StdDev * float64(c.N-1)
+	sq += (a.Mean - c.Mean) * (a.Mean - c.Mean) * float64(a.N) * float64(c.N) / float64(n)
+
+	sd := 0.0
+	if n > 1 {
+		sd = math.Sqrt(sq / float64(n-1))
+	}
+	return Dist{Mean: mean, StdDev: sd, N: n}
+}
+
+// Recalibrate observes the host for the configured warm-up, folds what it sees
+// into base, and saves the result. A nil base becomes the new baseline, so the
+// same call also serves a first capture that was never persisted.
+//
+// Everything observed during the window is treated as confirmed benign: the
+// operator runs this while a workload they have judged harmless is active. It is
+// an explicit action rather than an automatic one for exactly that reason.
+func Recalibrate(ctx context.Context, cfg config.Config, b *bus.Bus, base *Baseline) (*Baseline, error) {
+	fresh, err := Capture(ctx, cfg, b)
+	if err != nil {
+		return nil, err
+	}
+
+	if base == nil {
+		base = fresh
+	} else if _, err := base.Merge(fresh); err != nil {
+		return nil, err
+	}
+
+	if err := base.Save(cfg.Calibration.BaselinePath); err != nil {
+		return nil, err
+	}
+	return base, nil
 }
 
 func meanStdDev(xs []float64) (float64, float64) {

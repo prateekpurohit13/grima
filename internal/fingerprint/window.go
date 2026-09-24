@@ -3,6 +3,8 @@
 package fingerprint
 
 import (
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/prateekpurohit13/grima/internal/event"
@@ -11,6 +13,14 @@ import (
 // ringCapacity bounds retained samples per process, capping memory at
 // (live processes x ringCapacity) regardless of uptime.
 const ringCapacity = 4096
+
+// seqCap bounds the kind sequence an n-gram is read from, so the aggregate over
+// a large process tree costs no more than a single process's ring.
+const seqCap = ringCapacity
+
+// kindHashBase is the multiplier of the rolling k-gram hash. Any odd constant
+// works: the alphabet is the event-kind vocabulary, which is small.
+const kindHashBase uint64 = 131
 
 // HostName labels the fingerprint that collects file events no process could be
 // blamed for, so their evidence still reaches scoring.
@@ -97,6 +107,7 @@ type TreeVector struct {
 	Entropy       []EntropySample
 	MagicTotal    int
 	MagicMismatch int
+	NGram         NGram
 
 	CumFilesRewritten int64
 	CumBytesRewritten int64
@@ -119,6 +130,7 @@ type Window struct {
 	Entropy       []EntropySample
 	MagicTotal    int
 	MagicMismatch int
+	NGram         NGram
 
 	CumFilesRewritten int64
 	CumBytesRewritten int64
@@ -140,6 +152,7 @@ type counts struct {
 	entropy  []EntropySample
 	magicBad int
 	magicAll int
+	kinds    []event.Kind // newest-first until finish orders it
 }
 
 func newCounts() *counts {
@@ -161,6 +174,7 @@ func (c *counts) add(s sample) {
 	if s.dir != "" {
 		c.dirs[s.dir] = struct{}{}
 	}
+	c.kinds = append(c.kinds, s.kind)
 	if s.kind != event.KindFileWrite {
 		return
 	}
@@ -171,4 +185,137 @@ func (c *counts) add(s sample) {
 	if s.entropy > 0 {
 		c.entropy = append(c.entropy, EntropySample{Ext: s.ext, H: s.entropy})
 	}
+}
+
+// finish orders the kind sequence chronologically and trims it to the most
+// recent seqCap events, ready for the n-gram feature.
+func (c *counts) finish() {
+	slices.Reverse(c.kinds)
+	if len(c.kinds) > seqCap {
+		c.kinds = c.kinds[len(c.kinds)-seqCap:]
+	}
+}
+
+// ngram reads the sequence feature off the accumulated window.
+func (c *counts) ngram(k int) NGram { return ngramOf(c.kinds, k) }
+
+// NGram is the sequence feature of a window. Ransomware overwrites a file and
+// then renames it to a new extension, so a write immediately followed by a
+// rename is the transition that separates encryption from ordinary
+// modification; a bulk build, archive or backup writes without renaming.
+type NGram struct {
+	K            int     // k, from window.ngram_length
+	Total        int     // k-grams observed in the window
+	Sequence     string  // the most frequent k-gram, reduced to its cycle when it repeats
+	Count        int     // occurrences of Sequence
+	RenameChains int     // k-grams containing a write followed by a rename
+	ChainShare   float64 // RenameChains / Total
+}
+
+// ngramOf derives the feature from a window's kinds in chronological order.
+// k-grams are counted by rolling hash, so a busy window builds no string key per
+// k-gram. It returns the zero value when the window holds fewer than k events,
+// which is not the same as "no chains observed".
+func ngramOf(kinds []event.Kind, k int) NGram {
+	out := NGram{K: k}
+	if k <= 0 || len(kinds) < k {
+		return out
+	}
+	out.Total = len(kinds) - k + 1
+
+	pow := uint64(1)
+	for range k {
+		pow *= kindHashBase
+	}
+
+	seen := make(map[uint64]int, out.Total)
+	var hash uint64
+	best, bestAt := 0, 0
+	chains := 0
+
+	for i, kind := range kinds {
+		hash = hash*kindHashBase + uint64(kind)
+		if i >= k {
+			hash -= uint64(kinds[i-k]) * pow
+		}
+		if i < k-1 {
+			continue
+		}
+
+		// Slide the chain window: the k-gram at start gains the pair (i-1, i)
+		// and loses the pair (start-1, start).
+		start := i - k + 1
+		switch {
+		case start == 0:
+			for j := start; j < i; j++ {
+				if isRenameChain(kinds[j], kinds[j+1]) {
+					chains++
+				}
+			}
+		default:
+			if isRenameChain(kinds[i-1], kinds[i]) {
+				chains++
+			}
+			if isRenameChain(kinds[start-1], kinds[start]) {
+				chains--
+			}
+		}
+		if chains > 0 {
+			out.RenameChains++
+		}
+
+		n := seen[hash] + 1
+		seen[hash] = n
+		if n > best {
+			best, bestAt = n, i
+		}
+	}
+
+	out.Count = best
+	out.Sequence = renderKinds(kinds[bestAt-k+1 : bestAt+1])
+	out.ChainShare = float64(out.RenameChains) / float64(out.Total)
+	return out
+}
+
+// isRenameChain reports whether an event kind is followed by the rename an
+// encryptor performs after overwriting a file.
+func isRenameChain(prev, next event.Kind) bool {
+	return prev == event.KindFileWrite && next == event.KindFileRename
+}
+
+// renderKinds renders a k-gram compactly: a periodic k-gram becomes the cycle it
+// repeats ("file_write>file_rename"), which is the shape a loop has, and a
+// non-repeating one is truncated so a signal Detail stays readable.
+func renderKinds(kinds []event.Kind) string {
+	const limit = 48
+	for p := 1; p < len(kinds); p++ {
+		if len(kinds)%p == 0 && periodic(kinds, p) {
+			return joinKinds(kinds[:p], limit)
+		}
+	}
+	return joinKinds(kinds, limit)
+}
+
+// periodic reports whether the whole sequence repeats with period p.
+func periodic(kinds []event.Kind, p int) bool {
+	for i := p; i < len(kinds); i++ {
+		if kinds[i] != kinds[i%p] {
+			return false
+		}
+	}
+	return true
+}
+
+func joinKinds(kinds []event.Kind, limit int) string {
+	var b strings.Builder
+	for _, kind := range kinds {
+		if b.Len() > 0 {
+			b.WriteByte('>')
+		}
+		b.WriteString(kind.String())
+		if b.Len() > limit {
+			return b.String()[:limit] + "..."
+		}
+	}
+	return b.String()
 }

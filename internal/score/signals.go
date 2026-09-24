@@ -12,6 +12,13 @@ import (
 // than evidence.
 const minSignalValue = 0.05
 
+// The n-gram signal needs enough k-grams to be a share of something: below these
+// counts a window is too short for the ratio to mean anything.
+const (
+	minNGramWindows = 8
+	minRenameChains = 4
+)
+
 // computeSignals derives every available signal. Signals whose baseline input is
 // missing are omitted rather than zeroed: zero means "benign", not "unknown".
 func (s *Scorer) computeSignals(in Inputs, calibrated bool) []Signal {
@@ -45,6 +52,9 @@ func (s *Scorer) computeSignals(in Inputs, calibrated bool) []Signal {
 		}
 	}
 	if sg, ok := magicSignal(tv); ok {
+		out = append(out, sg)
+	}
+	if sg, ok := ngramRenameChainSignal(tv); ok {
 		out = append(out, sg)
 	}
 	if sg, ok := bytesRewrittenSignal(tv); ok {
@@ -137,6 +147,31 @@ func magicSignal(tv fingerprint.TreeVector) (Signal, bool) {
 		Value: clamp01(float64(tv.MagicMismatch) / float64(tv.MagicTotal) * 2),
 		Detail: fmt.Sprintf("magic bytes disagree with extension on %d of %d writes",
 			tv.MagicMismatch, tv.MagicTotal),
+	}, true
+}
+
+// ngramRenameChainSignal reads the fingerprint's sequence feature. An encryptor
+// overwrites a file and then renames it to a new extension, so a window whose
+// k-grams are write-then-rename chains is encryption-like; a compiler, archiver
+// or backup writes without renaming, so its share stays at zero. The measure
+// needs no baseline — it is a statement about the window's own sequence.
+func ngramRenameChainSignal(tv fingerprint.TreeVector) (Signal, bool) {
+	ng := tv.NGram
+	if ng.Total < minNGramWindows || ng.RenameChains < minRenameChains {
+		return Signal{}, false
+	}
+	// A quarter of the window being chains is ordinary file management; eight in
+	// ten saturates.
+	value := clamp01((ng.ChainShare - 0.25) / 0.55)
+	if value <= 0 {
+		return Signal{}, false
+	}
+	return Signal{
+		Name:  "ngram_rename_chain",
+		Class: ClassSecondary,
+		Value: value,
+		Detail: fmt.Sprintf("%d of %d %d-grams hold a write>rename chain; dominant %s x%d",
+			ng.RenameChains, ng.Total, ng.K, ng.Sequence, ng.Count),
 	}, true
 }
 

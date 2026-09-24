@@ -174,9 +174,16 @@ alert names the right process, or show the measured accuracy number that explain
 | 2.6 | Tree aggregation under a real split | W1 | A parent that forks N children each below threshold is scored as one actor above threshold |
 | 2.7 | Fingerprint memory bound | W2 | Live process count × ring capacity verified bounded over a long run; `Reap` confirmed on exit |
 | 2.8 | Scenario corpus, first cut | W3 | Benign workloads scripted and repeatable: compile, `npm install`, archive, video encode |
+| 2.9 | **Tune `attribution.max_delay`** | W1 | The causal path is 100% accurate and the correlation fallback 0%, so the 3.1% miss is entirely events whose audited record arrived late. Measure the accuracy/latency curve and pick a default from it. Needs an elevated run — §14 |
+| 2.10 | **Report variance, not a single figure** | W3 | Two runs of one scenario scored 100 and 56.4 for a purely environmental reason (§15). The harness must report per-round spread for TTD and detection rate, not one number |
+| 2.11 | **Re-baseline the smoke tests on the new fusion** | W3 | The noisy-OR change (§15) raises scores, so the level thresholds in `smoke.sh` and `smoke-linux.sh` were calibrated against a different formula. Confirm the thresholds still assert what they should |
 
 **Sprint review demo:** drip encryption caught live — the case that defeats every
 fixed-window detector.
+
+**Carried in from Sprint 1.** Items 2.9–2.11 were not in the original plan; they come from
+what Sprint 1 measured. 2.9 and 2.10 exist because the measurements were taken and the
+results were surprising, not because the sprint finished short.
 
 ---
 
@@ -303,7 +310,7 @@ Verified against the code, not assumed:
 
 | Gap | Evidence | Where it lands |
 |---|---|---|
-| **`window.ngram_length` is dead config** | Parsed, defaulted, validated — never read. No n-gram feature or signal exists, though `design.md` §6 and `architecture.md` §6 both describe one | Sprint 2 item 2.1 |
+| ~~`window.ngram_length` is dead config~~ | **Resolved in Sprint 2** — the ring's event-kind sequence is scored as signal #14 `ngram_rename_chain` (Secondary, weight 0.5) | Done; see `design.md` §6 |
 | ~~Attribution unreliable~~ | **Resolved in Sprint 1** — correlation measured 0%, causal attribution measured 96.9%. Elevation is now a deployment requirement, not a gap | Done; see §11 |
 | ~~Decoy touch never observed firing~~ | **Resolved in Sprint 1** — verified in unit tests and end to end at critical | Done |
 | **Suspend path untested** | Implemented for Windows and POSIX, never executed | Sprint 3 item 3.2 |

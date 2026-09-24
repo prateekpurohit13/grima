@@ -1,11 +1,14 @@
 package score
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/prateekpurohit13/grima/internal/calibrate"
 	"github.com/prateekpurohit13/grima/internal/config"
+	"github.com/prateekpurohit13/grima/internal/event"
 	"github.com/prateekpurohit13/grima/internal/fingerprint"
 )
 
@@ -209,5 +212,60 @@ func TestAddingEvidenceNeverLowersTheScore(t *testing.T) {
 	if extra.Score < fewer.Score {
 		t.Fatalf("more evidence scored lower: %.1f with %d signals, %.1f with %d",
 			fewer.Score, len(fewer.Signals), extra.Score, len(extra.Signals))
+	}
+}
+
+// 2.1 end to end: the configured n-gram length is read from the ring, becomes a
+// feature, and arrives in a verdict as evidence with a readable detail. The
+// happy path encrypts and renames; the sad path rewrites the same volume of
+// files and renames nothing.
+func TestNGramRenameChainReachesTheVerdict(t *testing.T) {
+	cfg := config.Default()
+	cfg.Window.DecayHalfLife = config.Duration(time.Hour)
+	cfg.Window.NGramLength = 4
+	scorer := NewScorer(cfg)
+
+	drive := func(procName string, rename bool) fingerprint.TreeVector {
+		engine := fingerprint.NewEngine(cfg)
+		now := time.Now()
+		engine.Apply(event.Event{Kind: event.KindProcessStart, PID: 7, ProcName: procName, Time: now})
+		for i := range 12 {
+			path := fmt.Sprintf("/data/report%d.docx", i)
+			engine.Apply(event.Event{Kind: event.KindFileWrite, PID: 7, Path: path, Bytes: 4096, Time: now})
+			if rename {
+				engine.Apply(event.Event{Kind: event.KindFileRename, PID: 7, Path: path, Time: now})
+			}
+		}
+		return engine.Aggregate(7)
+	}
+
+	find := func(signals []Signal, name string) (Signal, bool) {
+		for _, sg := range signals {
+			if sg.Name == name {
+				return sg, true
+			}
+		}
+		return Signal{}, false
+	}
+
+	encrypting := scorer.Evaluate(Inputs{Tree: drive("cryptor", true)})
+	sg, ok := find(encrypting.Signals, "ngram_rename_chain")
+	if !ok {
+		t.Fatalf("write-then-rename activity produced no n-gram signal: %v", encrypting.Signals)
+	}
+	t.Logf("detail: %s", sg.Detail)
+	if sg.Value != 1 {
+		t.Fatalf("signal value = %.2f, want 1 for a window that is all chains", sg.Value)
+	}
+	if !strings.Contains(sg.Detail, "4-grams") {
+		t.Fatalf("detail %q does not report the configured n-gram length", sg.Detail)
+	}
+	if encrypting.Score <= 0 {
+		t.Fatalf("score = %.1f, want above zero from the n-gram signal alone", encrypting.Score)
+	}
+
+	benign := scorer.Evaluate(Inputs{Tree: drive("bulk-rewriter", false)})
+	if sg, ok := find(benign.Signals, "ngram_rename_chain"); ok {
+		t.Fatalf("write-only activity produced an n-gram signal: %s", sg.Detail)
 	}
 }

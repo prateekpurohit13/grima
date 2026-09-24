@@ -1,10 +1,17 @@
 package calibrate
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/prateekpurohit13/grima/internal/bus"
+	"github.com/prateekpurohit13/grima/internal/config"
+	"github.com/prateekpurohit13/grima/internal/event"
 )
 
 func sampleBaseline() *Baseline {
@@ -155,5 +162,324 @@ func TestKnowsExt(t *testing.T) {
 	var absent *Baseline
 	if !absent.KnowsExt(".locked") {
 		t.Fatal("with no baseline, nothing can be called unknown")
+	}
+}
+
+// --- observations -----------------------------------------------------------
+
+func writeEvent(at time.Time, proc, path string, entropy float64, pid int32) event.Event {
+	return event.Event{
+		Time:     at,
+		Kind:     event.KindFileWrite,
+		PID:      pid,
+		ProcName: proc,
+		Path:     path,
+		Entropy:  entropy,
+		Bytes:    4096,
+	}
+}
+
+// A measurement set built from events is what a capture measures: per-extension
+// entropy, per-process write rates, and the extensions the host has seen.
+func TestObservationsMeasureWhatCaptureRecords(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "legacy.bak"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.General.MonitorPaths = []string{dir}
+	cfg.Calibration.MinSamples = 5
+
+	obs := NewObservations()
+	start := time.Unix(1_700_000_000, 0)
+	for i := range 10 {
+		obs.Observe(writeEvent(start.Add(time.Duration(i)*time.Second), "writer.exe",
+			filepath.Join(dir, fmt.Sprintf("doc_%d.txt", i)), 4.0, 4242))
+	}
+
+	baseline := obs.Baseline(cfg, 10*time.Second)
+
+	dist, ok := baseline.Sigma(".txt")
+	if !ok {
+		t.Fatal("the writes produced no .txt entropy distribution")
+	}
+	if dist.Mean != 4.0 {
+		t.Fatalf("mean entropy = %v, want 4.0", dist.Mean)
+	}
+	if rate := baseline.WriteRateByProc["writer.exe"]; rate != 1.0 {
+		t.Fatalf("write rate = %v, want 1 write/s over 10s", rate)
+	}
+	if !baseline.KnowsExt(".txt") {
+		t.Fatal("an extension the host wrote to is known")
+	}
+	// Extensions already on disk count as known even with no event for them.
+	if !baseline.KnowsExt(".bak") {
+		t.Fatal("an extension present under the monitored path is known")
+	}
+	if !baseline.Ready() {
+		t.Fatal("ten samples against a minimum of five is ready")
+	}
+
+	// An unattributed write carries content evidence but no process rate.
+	obs.Observe(writeEvent(start, "", filepath.Join(dir, "host.dat"), 7.9, 0))
+	obs.Observe(writeEvent(start.Add(time.Second), "", filepath.Join(dir, "host2.dat"), 7.8, 0))
+	baseline = obs.Baseline(cfg, 10*time.Second)
+	if _, ok := baseline.Sigma(".dat"); !ok {
+		t.Fatal("an unattributed write still produces an entropy distribution")
+	}
+	if len(baseline.WriteRateByProc) != 1 {
+		t.Fatalf("process rates = %v, want only the attributed writer", baseline.WriteRateByProc)
+	}
+}
+
+// --- recalibration ----------------------------------------------------------
+
+// Pooling keeps both windows' evidence: the samples add up, and the uncertainty
+// grows to cover the fact that the host has been measured in two regimes.
+func TestMergePoolsDistributions(t *testing.T) {
+	base := sampleBaseline()
+	fresh := &Baseline{
+		Version:       Version,
+		Host:          base.Host,
+		WarmupSeconds: 50,
+		EntropyByExt:  map[string]Dist{".docx": {Mean: 6.2, StdDev: 0.3, N: 50}},
+	}
+
+	if _, err := base.Merge(fresh); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	dist, ok := base.Sigma(".docx")
+	if !ok {
+		t.Fatal("the pooled distribution is not usable")
+	}
+	if dist.N != 100 {
+		t.Fatalf("samples = %d, want the two windows' 50 + 50", dist.N)
+	}
+	if dist.Mean != 5.2 {
+		t.Fatalf("mean = %v, want the weighted 5.2", dist.Mean)
+	}
+	if dist.StdDev <= 0.3 {
+		t.Fatalf("stddev = %v, want the between-window spread folded in", dist.StdDev)
+	}
+}
+
+// The feedback edge: an extension the operator has confirmed benign stops
+// counting as unknown, which is what retires the novelty signal.
+func TestMergePromotesObservedExtensions(t *testing.T) {
+	base := sampleBaseline()
+	fresh := &Baseline{
+		Version:       Version,
+		Host:          base.Host,
+		WarmupSeconds: 30,
+		EntropyByExt:  map[string]Dist{".obj": {Mean: 7.2, StdDev: 0.1, N: 200}},
+		KnownExt:      []string{".obj", ".txt"},
+	}
+
+	promoted, err := base.Merge(fresh)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if promoted != 1 {
+		t.Fatalf("promoted = %d, want the one extension the baseline did not know", promoted)
+	}
+	if !base.KnowsExt(".obj") {
+		t.Fatal(".obj is known after recalibration")
+	}
+	if len(base.KnownExt) != 3 {
+		t.Fatalf("known extensions = %v, want no duplicate of .txt", base.KnownExt)
+	}
+}
+
+// Rates are counts over time, so the merge is total counts over total time:
+// a short burst must not displace a long baseline, or the reverse.
+func TestMergeAveragesWriteRateAcrossWindows(t *testing.T) {
+	base := sampleBaseline()
+	base.WriteRateByProc["code"] = 2
+	base.WarmupSeconds = 600
+
+	fresh := &Baseline{
+		Version:         Version,
+		Host:            base.Host,
+		WarmupSeconds:   200,
+		WriteRateByProc: map[string]float64{"code": 10},
+	}
+
+	if _, err := base.Merge(fresh); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	if got := base.WriteRateByProc["code"]; got != 4 {
+		t.Fatalf("rate = %v, want (2*600 + 10*200)/800", got)
+	}
+	if base.WarmupSeconds != 800 {
+		t.Fatalf("window = %v, want 800s of observations represented", base.WarmupSeconds)
+	}
+}
+
+// A baseline too thin for deviation signals becomes usable once recalibration
+// has added samples, without any second capture.
+func TestMergeCanMakeABaselineReady(t *testing.T) {
+	base := sampleBaseline()
+	base.MinSamples = 500
+	if base.Ready() {
+		t.Fatal("a baseline with 50 samples is not ready against a minimum of 500")
+	}
+
+	fresh := &Baseline{
+		Version:       Version,
+		Host:          base.Host,
+		WarmupSeconds: 60,
+		EntropyByExt:  map[string]Dist{".txt": {Mean: 4.1, StdDev: 0.4, N: 460}},
+	}
+
+	if _, err := base.Merge(fresh); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !base.Ready() {
+		t.Fatal("510 samples against a minimum of 500 is ready")
+	}
+}
+
+// Sad path: another host's measurements describe a machine that does not exist.
+func TestMergeRejectsAnotherHostsObservations(t *testing.T) {
+	base := sampleBaseline()
+	fresh := &Baseline{
+		Version:       Version,
+		Host:          "elsewhere",
+		WarmupSeconds: 10,
+		EntropyByExt:  map[string]Dist{".obj": {Mean: 7.2, StdDev: 0.1, N: 10}},
+		KnownExt:      []string{".obj"},
+	}
+
+	if _, err := base.Merge(fresh); err == nil {
+		t.Fatal("merging another host's measurements must fail")
+	}
+	if base.KnowsExt(".obj") {
+		t.Fatal("a refused merge must leave the baseline unchanged")
+	}
+	if len(base.EntropyByExt) != 1 {
+		t.Fatalf("entropy distributions = %v, want only the original", base.EntropyByExt)
+	}
+}
+
+// Sad path: nothing to merge into, nothing to merge from.
+func TestMergeRejectsNil(t *testing.T) {
+	if _, err := (*Baseline)(nil).Merge(sampleBaseline()); err == nil {
+		t.Fatal("merging into a nil baseline must fail")
+	}
+	if _, err := sampleBaseline().Merge(nil); err == nil {
+		t.Fatal("merging nil observations must fail")
+	}
+}
+
+// Recalibrate is the operator-facing edge: observe the warm-up, fold it in, and
+// persist the result where the next run will load it.
+func TestRecalibrateMergesIntoTheStoredBaseline(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.General.MonitorPaths = []string{dir}
+	cfg.Calibration.Warmup = config.Duration(80 * time.Millisecond)
+	cfg.Calibration.MinSamples = 5
+	cfg.Calibration.BaselinePath = filepath.Join(dir, "baseline.json")
+
+	// The baseline as captured earlier, before this workload existed.
+	seen := NewObservations()
+	seen.Observe(writeEvent(time.Now(), "explorer.exe", filepath.Join(dir, "notes.txt"), 4.0, 11))
+	base := seen.Baseline(cfg, time.Second)
+	if err := base.Save(cfg.Calibration.BaselinePath); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	events := bus.New(256, bus.DropOldest)
+	defer events.Close()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tick := time.NewTicker(5 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				events.Publish(writeEvent(time.Now(), "cc1.exe",
+					filepath.Join(dir, "obj", "unit.o"), 7.2, 99))
+			}
+		}
+	}()
+
+	merged, err := Recalibrate(context.Background(), cfg, events, base)
+	close(stop)
+	wg.Wait()
+
+	if err != nil {
+		t.Fatalf("recalibrate: %v", err)
+	}
+	if !merged.KnowsExt(".o") {
+		t.Fatal("recalibration did not promote the extension the workload wrote")
+	}
+	if merged.WriteRateByProc["cc1.exe"] <= 0 {
+		t.Fatal("recalibration did not record the workload's write rate")
+	}
+
+	stored, err := Load(cfg.Calibration.BaselinePath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("the recalibrated baseline was not saved")
+	}
+	if !stored.KnowsExt(".o") {
+		t.Fatal("the stored baseline does not carry the recalibration")
+	}
+}
+
+// Sad path: recalibration is not a way to lose a baseline, and an unwritable
+// path is reported rather than silently dropped.
+func TestRecalibrateReportsUnwritableBaseline(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.General.MonitorPaths = []string{dir}
+	cfg.Calibration.Warmup = config.Duration(20 * time.Millisecond)
+	cfg.Calibration.BaselinePath = filepath.Join(dir, "missing", "nested", "baseline.json")
+
+	events := bus.New(64, bus.DropOldest)
+	defer events.Close()
+
+	if _, err := Recalibrate(context.Background(), cfg, events, nil); err == nil {
+		t.Fatal("saving to a path whose directory does not exist must fail")
+	}
+}
+
+// A first recalibration with no stored baseline behaves as a capture.
+func TestRecalibrateWithoutABaselineCaptures(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.General.MonitorPaths = []string{dir}
+	cfg.Calibration.Warmup = config.Duration(20 * time.Millisecond)
+	cfg.Calibration.BaselinePath = filepath.Join(dir, "baseline.json")
+
+	events := bus.New(64, bus.DropOldest)
+	defer events.Close()
+
+	baseline, err := Recalibrate(context.Background(), cfg, events, nil)
+	if err != nil {
+		t.Fatalf("recalibrate: %v", err)
+	}
+	if baseline == nil {
+		t.Fatal("recalibration with no stored baseline must produce one")
+	}
+	if baseline.Version != Version {
+		t.Fatalf("version = %d, want %d", baseline.Version, Version)
+	}
+
+	stored, err := Load(cfg.Calibration.BaselinePath)
+	if err != nil || stored == nil {
+		t.Fatalf("Load = (%v, %v), want the saved baseline", stored, err)
 	}
 }

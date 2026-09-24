@@ -45,8 +45,7 @@ grima-baseline.json
 # Smoke test scratch
 /.smoke/
 
-# Sprint scratch: per-agent build output and configs
-/.sprint1/
-
-# Audit scratch
+# Sprint scratch: per-agent build output, configs and result files. A glob so a
+# new sprint's directory is ignored without anyone remembering to add it.
+/.sprint*/
 /.audit/

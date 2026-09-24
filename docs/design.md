@@ -245,6 +245,7 @@ type Signal struct {
 | 11 | `static_reputation` | Secondary | none | **Phase 7** — not yet emitted |
 | 12 | `decoy_touch` | Override | none | Implemented (rule `R-DECOY-TOUCH`) |
 | 13 | `bus_drops` | Secondary | none | Implemented |
+| 14 | `ngram_rename_chain` | Secondary | none — the window's own sequence | Implemented |
 
 ### Normalization rules
 
@@ -254,9 +255,12 @@ type Signal struct {
 - **Signals below a noise floor of 0.05 are dropped.** Without this, a process that
   wrote a few kilobytes produces a verdict and every writing process looks like a
   detection.
-- Signals with no baseline input are **unavailable** in uncalibrated mode and are
-  omitted from the signal list rather than reported as `0`. Reporting `0` would
-  misrepresent *unknown* as *benign*.
+- Deviation signals (`entropy_deviation`, `write_burst`, `rename_burst`,
+  `unknown_extension_activity`, `delete_rate`, `dir_fanout`) compare against the baseline,
+  so while the host is uncalibrated they are **unavailable** and are omitted from the
+  signal list rather than reported as `0`. Reporting `0` would misrepresent *unknown* as
+  *benign*. Signals that read the window's own contents — `magic_mismatch`,
+  `cum_bytes_rewritten`, `bus_drops`, `ngram_rename_chain` — are available either way.
 - `write_rate_absolute` exists precisely because omitting deviation signals leaves
   uncalibrated mode thin. It is a fixed bulk-modification threshold
   (`scoring.absolute_write_rate`, default 20 writes/s) and is superseded by
@@ -269,7 +273,8 @@ type Signal struct {
 arrives as a separate create event. A signal keyed on rename destinations would therefore
 never fire. Counting writes and creates per extension captures the same evidence (a mass
 rename to `.locked` shows up as a burst of creates on an extension the host has never
-seen) using data that is actually available.
+seen) using data that is actually available. The n-gram signal (#14) is unaffected by
+this: it reads the *kind* of each event, not its destination.
 
 ---
 
@@ -294,6 +299,7 @@ type TreeVector struct {
     Entropy       []EntropySample
     MagicTotal    int
     MagicMismatch int
+    NGram         NGram
 
     // Non-decaying track.
     CumFilesRewritten int64
@@ -322,7 +328,8 @@ func (e *Engine) Live() int
 - `Apply` is called from exactly one goroutine. No internal locking.
 - The decaying track ages out entries older than `window.decay_half_life`. Samples live in
   a fixed-capacity ring (`ringCapacity`, 4096), so memory is bounded by live process count
-  rather than uptime.
+  rather than uptime: once the ring is full the oldest sample is overwritten and no longer
+  counted, and the kind sequence the n-gram reads is bounded by the same cap.
 - The cumulative track **never decays**. This is the mechanism that answers Gap 4.
 - `ExtActivity` counts writes and creates per extension, cumulatively. It is what
   `unknown_extension_activity` reads, and it needs no file content — so it survives the
@@ -335,15 +342,47 @@ func (e *Engine) Live() int
   (`HostName`, PID 0) so their file-derived evidence still reaches scoring. Detection must
   not depend on attribution succeeding — see `sprints.md` §13.
 
-### Not implemented: event n-grams
+### Event-kind n-grams
 
-An event-type n-gram would be a useful discriminator, and `window.ngram_length` exists in
-configuration. **No n-gram feature is computed and no n-gram signal is emitted.** The
-config key is currently dead.
+The ring records the `Kind` of every sample, so a window is also a short sequence of event
+kinds (`file_write, file_rename, file_write, …`). `Window` and `TreeVector` expose it as
+`NGram`, computed over the samples still inside the decay window with
+$k = \texttt{window.ngram\_length}$:
 
-This is tracked as sprint item 2.1: either the feature is implemented and appears in
-verdicts, or the claim and the config key are removed. Until then, treat the n-gram as
-absent.
+```go
+type NGram struct {
+    K            int     // k, from window.ngram_length
+    Total        int     // k-grams observed in the window
+    Sequence     string  // the most frequent k-gram, reduced to its cycle when it repeats
+    Count        int     // occurrences of Sequence
+    RenameChains int     // k-grams containing a write followed by a rename
+    ChainShare   float64 // RenameChains / Total
+}
+```
+
+- The feature separates encryption from ordinary modification by *shape*. An encryptor
+  overwrites a file and then renames it to a new extension, so its window is dense in
+  `file_write → file_rename` transitions; a compiler, archiver or backup writes and
+  renames nothing, so its share is zero.
+- Only a **write** followed by a **rename** counts. A `file_create → file_rename` pair is
+  not a chain: installers, editors and compilers do that constantly.
+- `Total == 0` means the window held fewer than `k` events — no observation, which is not
+  the same as "no chains". The scorer emits the signal only when `Total` and
+  `RenameChains` both clear a floor.
+- The tree aggregate reads one sequence over the whole tree (each member's in-window
+  samples in walk order), so a split workload's shape survives aggregation rather than
+  being averaged across children.
+- k-grams are counted by rolling hash over a sequence bounded by `ringCapacity`, and the
+  ring is the only storage, so the feature adds no retained state.
+- The measure is a *shape*, not intent: an extractor writes a temporary file and renames
+  it into place, and an editor doing atomic saves does the same, so both look like an
+  encryptor. That is why the signal is Secondary, why its weight is a starting point
+  rather than a calibrated value, and why Sprint 4's ablation has to report its standalone
+  false-positive rate before the paper cites it.
+
+`score` turns it into signal #14, `ngram_rename_chain`; whether it earns its weight is
+Sprint 4's ablation. Item 2.1 is closed by this — the gap it recorded (a parsed-but-unread
+`window.ngram_length`) no longer exists.
 
 ---
 
