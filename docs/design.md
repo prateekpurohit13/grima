@@ -380,11 +380,20 @@ type NGram struct {
   being averaged across children.
 - k-grams are counted by rolling hash over a sequence bounded by `ringCapacity`, and the
   ring is the only storage, so the feature adds no retained state.
-- The measure is a *shape*, not intent: an extractor writes a temporary file and renames
-  it into place, and an editor doing atomic saves does the same, so both look like an
-  encryptor. That is why the signal is Secondary, why its weight is a starting point
-  rather than a calibrated value, and why Sprint 4's ablation has to report its standalone
-  false-positive rate before the paper cites it.
+- Measured on Windows with the real sensor, the shape is narrower than it looks. An
+  atomic save over an existing file arrives as `create, write, delete, rename` — the temp
+  file's removal is reported as a delete between the write and the rename — so it produces
+  **no chain at all**, and editors and config managers stay silent. An extractor,
+  installer or release script that renames a new file to a new name arrives as
+  `create, write, rename`, which reaches the same value an encryptor reaches
+  (`write, rename, create`): the two cycles are *rotations* of one another, so this
+  feature cannot separate extraction from encryption. That separation is left to the
+  content signals — hence the deliberately low weight below.
+- Because of that overlap the signal ships with a **weight of 0.2**, where `bus_drops`
+  sits: at full value a benign extraction scores 20 — under the medium alert band — so it
+  corroborates the content signals on a real encryptor instead of raising an alert by
+  itself. Sprint 4's ablation still has to report its per-scenario false-positive rate
+  before the paper cites it.
 
 `score` turns it into signal #14, `ngram_rename_chain`; whether it earns its weight is
 Sprint 4's ablation. Item 2.1 is closed by this — the gap it recorded (a parsed-but-unread
@@ -451,14 +460,18 @@ func (b *Baseline) Ready() bool
 
 ### Known limitation: recalibration does not fix `dir_fanout`
 
-Recalibration promotes observed extensions and re-averages per-process write rates, but a
-workload that touches an order of magnitude more directories than any other process on the
-host still trips `dir_fanout` (Secondary, weight 0.5) against the pooled host mean. Measured
-at 23.3 — below the 45 medium threshold on the test host's baseline, so it does not alert
-today, but the margin is thin and a more scattered workload would cross it.
+Recalibration silences novelty and rate deviations. It does **not** silence fan-out.
 
-The fix is per-process directory-fanout profiles rather than a single host distribution.
-That is Sprint 4 work, and it should be measured before `dir_fanout` is relied on.
+`dir_fanout` compares a tree's distinct-directory count against the pooled host mean:
+$\text{value} = \mathrm{clamp}_{[0,1]}\left(\frac{dirs/mean - 1}{7}\right)$ at weight 0.5, so
+alone it reaches the 45 medium threshold at roughly **7×** the pooled host mean. In a
+measured v2 run the pooled mean after recalibration was 5.44 (n=9), so a confirmed-benign
+workload touching about 40 directories still alerts at medium *after* recalibration.
+
+The exit criterion therefore holds only below that ratio — the honest boundary, rather than
+one measured pair. The fix is per-process directory-fanout profiles instead of a single
+pooled host distribution: Sprint 4 work, and it should be measured before `dir_fanout` is
+relied on.
 
 ---
 

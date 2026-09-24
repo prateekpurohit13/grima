@@ -23,6 +23,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 14. [Causal Attribution: What Landed](#14-causal-attribution-what-landed)
 15. [Fusion Was Not Monotonic](#15-fusion-was-not-monotonic)
 16. [Calibration Units Were Mismatched](#16-calibration-units-were-mismatched)
+17. [`ngram_rename_chain` Cannot Tell Extraction From Encryption](#17-ngram_rename_chain-cannot-tell-extraction-from-encryption)
 
 ---
 
@@ -929,3 +930,72 @@ test fails if the signal ever compares against it again.
 it was a units error that survived because no test exercised the signals against a baseline
 measured on a busy host. Worth remembering for Sprint 4: a signal is not validated by firing
 in a quiet test harness.
+
+---
+
+## 17. `ngram_rename_chain` Cannot Tell Extraction From Encryption
+
+Sprint 2 item 2.1 closed the n-gram gap by implementing it rather than deleting the claim.
+The implementation is sound and the docs now match the code. But measuring it produced a
+result that limits what the signal can be trusted for.
+
+### What it measures
+
+The share of k-grams in the window holding a **write immediately followed by a rename**
+(k = `window.ngram_length`, default 32). It is signal #14, Secondary, weight **0.2** — lowered
+from 0.5 after the measurement below.
+
+### Measured against three workloads
+
+Real `filewatch` on Windows, real engine, 30 s window, k=32:
+
+| Workload | Adjacent transitions | Chains / k-grams | Value |
+|---|---|---|---|
+| Atomic save over an existing file (118 saves, 40 files) | `write→delete=78`, `delete→rename=78`, **`write→rename`=0** | 0 / 363 | **absent** |
+| Extractor / installer (118 writes to new names) | `write→rename=118` | 445 / 445 | **1.0** |
+| Encryption fixture (40 `.docx` → `.locked`) | `write→rename=39` | 87 / 87 | **1.0** |
+
+**It does not fire on atomic saves.** The intuitive worry — that every editor's save looks
+like encryption — is wrong, and empirically so: when the destination exists, the temp file's
+removal arrives as a `delete` *between* the write and the rename, so no `write→rename`
+transition occurs. Measured, not modelled.
+
+### The limit
+
+**It cannot distinguish an extractor from an encryptor.** The extraction cycle is
+`create→write→rename`; the encryptor's is `write→rename→create`. Those are **rotations of the
+same 3-cycle**, so over a dense burst the two windows hold the same multiset of k-grams, and
+no rotation-invariant measure over event kinds can separate them.
+
+Discriminator candidates were tested against the real sequences and all fail:
+
+- "chain not preceded by a create" excludes the encryptor too — its `create→write` belongs to
+  the *previous* file's destination create;
+- "create-light window" fails because the encryptor's renames also emit destination creates
+  (`create=39` vs `rename=39`);
+- create/rename and rename/write ratios are ≈1 for all three workloads.
+
+At the originally shipped weight of 0.5 the extraction shape **alerted on its own**:
+
+```
+level=WARN msg="ransomware risk detected" pid=28012 process=chrome.exe
+score=50.0 level=medium override="" signals=ngram_rename_chain
+```
+
+Lowering the weight to 0.2 stops it alerting alone (≈20, below the 45 medium band). That is
+**masking the false positive, not fixing it** — the signal still contributes to any fusion it
+joins, and it contributes identically for a benign extractor and a real encryptor.
+
+### What to do
+
+1. **Sprint 4's ablation decides.** The signal was implemented specifically so it could be
+   measured rather than assumed. If it does not move the detection rate and does add false
+   positives on extraction workloads, delete it — and cite this section as the reason.
+2. **Do not cite it as evidence of encryption** in the paper. It is evidence of *bulk
+   write-then-rename activity*, which extraction, installation, and deployment share with
+   encryption.
+3. **The weight is not a tuning question.** No weight makes a non-discriminating signal
+   discriminating; a lower weight only makes it quieter.
+
+This is the useful outcome of implementing rather than deleting: the gap is closed, and what
+the signal actually buys is now known instead of assumed.

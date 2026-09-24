@@ -289,8 +289,11 @@ func addTree(watcher *fsnotify.Watcher, root string) (int, error) {
 // readSample reads the head and tail of a file. Sampling rather than reading the
 // whole file bounds I/O under an encryption storm and still catches partial
 // encryption that leaves the middle untouched.
+//
+// The open shares delete, so sampling never blocks an application from renaming
+// or deleting a file it is reading — see openShared.
 func readSample(path string, size int) (head, tail []byte, total int64, err error) {
-	f, err := os.Open(path)
+	f, err := openShared(path)
 	if err != nil {
 		return nil, nil, 0, err
 	}
