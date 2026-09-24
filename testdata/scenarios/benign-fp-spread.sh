@@ -4,7 +4,10 @@
 # A single run is not a measurement: the same scenario has scored 100 and 56.4
 # for a purely environmental reason (whether the detector read a file before or
 # after it was renamed), so this reports min, median, max and how many rounds
-# alerted rather than one number.
+# alerted rather than one number. Each round's time to first alert is reported
+# too, with its own spread over the rounds that alerted — a false positive that
+# takes twenty seconds to appear is a different problem from one that fires on
+# the first write.
 #
 # Each round is a full benign-fp-check.sh pass — fresh calibration with the
 # workload running, then the measured pass — so the spread covers calibration
@@ -22,6 +25,10 @@
 #
 # Exits 0 when every round stayed silent, 1 when any round alerted, 2 when a
 # round could not complete.
+#
+# A round in which no verdict carried evidence is counted as a score of 0, and
+# the summary says how many rounds were like that, so "quiet" is never confused
+# with "the detector produced nothing at all".
 set -uo pipefail
 
 ROOT_SP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,10 +66,10 @@ echo "rounds: $WORK"
 echo
 
 scores=()
-levels=()
-signals=()
 alerts=()
+ttds=()
 failed=0
+bare=0
 
 round=0
 while [ "$round" -lt "$ROUNDS" ]; do
@@ -86,18 +93,22 @@ while [ "$round" -lt "$ROUNDS" ]; do
   level="$(printf '%s' "$result" | sed -n 's/.*max_level=\([^ ]*\).*/\1/p')"
   sig="$(printf '%s' "$result" | sed -n 's/.*max_signals=\([^ ]*\).*/\1/p')"
   n_alerts="$(printf '%s' "$result" | sed -n 's/.*alerts=\([0-9]*\).*/\1/p')"
+  round_ttd="$(printf '%s' "$result" | sed -n 's/.*ttd=\([^ ]*\).*/\1/p')"
   [ -n "$n_alerts" ] || n_alerts=0
+  [ -n "$round_ttd" ] || round_ttd=-
 
   if [ "$score" = "none" ]; then
-    echo "round $round: no verdict published, alerts=$n_alerts — see $log"
+    echo "round $round: no verdict carried evidence, alerts=$n_alerts ttd=$round_ttd — see $log"
     scores+=("0.0")
+    bare=$((bare + 1))
   else
-    echo "round $round: score=$score level=$level alerts=$n_alerts signals=${sig:--}"
+    echo "round $round: score=$score level=$level alerts=$n_alerts ttd=$round_ttd signals=${sig:--}"
     scores+=("$score")
   fi
-  levels+=("$level")
-  signals+=("$sig")
   alerts+=("$n_alerts")
+  if [ "$n_alerts" -gt 0 ] && [ "$round_ttd" != "-" ]; then
+    ttds+=("$round_ttd")
+  fi
 done
 
 completed=${#scores[@]}
@@ -107,16 +118,23 @@ if [ "$completed" -eq 0 ]; then
   exit 2
 fi
 
-sorted="$(printf '%s\n' "${scores[@]}" | sort -n)"
-min="$(printf '%s\n' "$sorted" | sed -n '1p')"
-max="$(printf '%s\n' "$sorted" | sed -n "${completed}p")"
-if [ $((completed % 2)) -eq 1 ]; then
-  median="$(printf '%s\n' "$sorted" | sed -n "$(( (completed + 1) / 2 ))p")"
-else
-  lo="$(printf '%s\n' "$sorted" | sed -n "$(( completed / 2 ))p")"
-  hi="$(printf '%s\n' "$sorted" | sed -n "$(( completed / 2 + 1 ))p")"
-  median="$(awk -v a="$lo" -v b="$hi" 'BEGIN { printf "%.1f", (a + b) / 2 }')"
-fi
+# spread_of <label> <value>... — prints min, median and max of the values.
+spread_of() {
+  local label="$1"; shift
+  local count=$# min max median lo hi sorted
+  [ "$count" -gt 0 ] || return 0
+  sorted="$(printf '%s\n' "$@" | sort -n)"
+  min="$(printf '%s\n' "$sorted" | sed -n '1p')"
+  max="$(printf '%s\n' "$sorted" | sed -n "${count}p")"
+  if [ $((count % 2)) -eq 1 ]; then
+    median="$(printf '%s\n' "$sorted" | sed -n "$(( (count + 1) / 2 ))p")"
+  else
+    lo="$(printf '%s\n' "$sorted" | sed -n "$(( count / 2 ))p")"
+    hi="$(printf '%s\n' "$sorted" | sed -n "$(( count / 2 + 1 ))p")"
+    median="$(awk -v a="$lo" -v b="$hi" 'BEGIN { printf "%.1f", (a + b) / 2 }')"
+  fi
+  echo "$label min=$min median=$median max=$max"
+}
 
 alerted_rounds=0
 for n in "${alerts[@]}"; do
@@ -125,8 +143,12 @@ done
 
 echo
 echo "--- spread over $completed completed round(s) ---"
-echo "score   min=$min median=$median max=$max"
+spread_of "score  " "${scores[@]}"
+# Time to first alert is only defined for rounds that alerted, so its spread is
+# over those rounds alone.
+[ "${#ttds[@]}" -gt 0 ] && spread_of "ttd(s) " "${ttds[@]}"
 echo "alerted $alerted_rounds/$completed round(s)"
+[ "$bare" -gt 0 ] && echo "quiet   $bare/$completed round(s) published no verdict at all (counted as 0)"
 [ "$failed" -gt 0 ] && echo "failed  $failed/$ROUNDS round(s) did not complete"
 
 echo

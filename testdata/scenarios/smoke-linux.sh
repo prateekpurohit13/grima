@@ -27,7 +27,31 @@ fail() { echo "FAIL: $*" >&2; [ -n "${KEEP_WORK:-}" ] || rm -rf "$WORK"; exit 1;
 pass() { echo "PASS: $*"; }
 
 mkdir -p "$DATA"
-trap '[ -n "${KEEP_WORK:-}" ] || rm -rf "$WORK"' EXIT
+GRIMA_PID=""
+trap 'kill "$GRIMA_PID" 2>/dev/null; [ -n "${KEEP_WORK:-}" ] || rm -rf "$WORK"' EXIT
+
+# Prints the highest-scoring verdict the dashboard is holding. Every assertion
+# below is level-based, and the level is a band, so the margin above or below a
+# band is what says whether an assertion is tight — the log alone only shows the
+# verdicts that alerted.
+report_peak() { # $1 label
+  curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/verdicts" > "$WORK/verdicts.json" 2>/dev/null || return 0
+  "$PYTHON" - "$WORK/verdicts.json" "$1" <<'PY'
+import json, sys
+levels = ["info", "low", "medium", "high", "critical"]
+try:
+    verdicts = json.load(open(sys.argv[1]))
+except ValueError:
+    verdicts = []
+if not verdicts:
+    print("peak verdict (%s): none carried evidence" % sys.argv[2])
+else:
+    v = max(verdicts, key=lambda x: x["Score"])
+    names = "; ".join(s["Name"] for s in (v.get("Signals") or [])) or "-"
+    print("peak verdict (%s): score=%.1f level=%s proc=%s signals=%s"
+          % (sys.argv[2], v["Score"], levels[v["Level"]], v["ProcName"], names))
+PY
+}
 
 # --- fixture -----------------------------------------------------------------
 
@@ -122,8 +146,14 @@ for round in 1 2 3; do
 done
 sleep 4
 
-if grep -qE 'level=(high|critical)' "$LOG"; then
-  cat "$LOG"; fail "benign rewrite produced a high verdict"
+report_peak "benign rewrite"
+
+# response.alert_min_level is medium, so any alert line at all is a false
+# positive. Asserting only "not high|critical" accepts the whole medium band —
+# the first band a benign workload can alert in, and the band §19 recorded a
+# benign atomic-save batch alerting in.
+if grep -q 'ransomware risk detected' "$LOG"; then
+  cat "$LOG"; fail "benign rewrite alerted"
 fi
 pass "benign rewrite did not alert"
 
@@ -145,11 +175,17 @@ dump_diagnostics() {
   > "$WORK/encryptor.log" 2>&1 || fail "encryptor fixture failed"
 sleep 6
 
-if ! grep -qE 'level=(high|critical)' "$LOG"; then
+report_peak "burst encryption"
+
+# The burst encryptor reaches critical on both platforms, so demanding critical
+# rather than high|critical closes the 30-point slack a high threshold leaves:
+# with noisy-OR fusion a run that has gone partly blind still lands in the high
+# band, which is exactly what the old threshold let through (docs/sprints.md §15).
+if ! grep -q 'level=critical' "$LOG"; then
   dump_diagnostics
-  fail "encryption workload was not detected on Linux"
+  fail "encryption workload was not detected at critical on Linux"
 fi
-pass "encryption workload detected"
+pass "encryption workload detected at critical"
 
 grep -q 'entropy_deviation\|magic_mismatch\|unknown_extension_activity' "$LOG" \
   && pass "content-derived signals fired" \
@@ -159,7 +195,7 @@ wait "$GRIMA_PID" 2>/dev/null
 
 echo
 echo "--- detected verdicts ---"
-grep -E 'level=(high|critical)' "$LOG" | sed -n '1,3p'
+grep -E 'level=critical' "$LOG" | sed -n '1,3p'
 
 echo
 echo "smoke test complete (Linux)"

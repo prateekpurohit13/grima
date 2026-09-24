@@ -79,6 +79,30 @@ esac
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
+# Prints the highest-scoring verdict the dashboard is holding. Every assertion
+# below is level-based, and the level is a band, so the margin above or below a
+# band is what says whether an assertion is tight — the log alone only shows the
+# verdicts that alerted. Best-effort: no dashboard, no line.
+report_peak() { # $1 label
+  curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/verdicts" > "$WORK_SH/verdicts.json" 2>/dev/null || return 0
+  "$PYTHON" -c 'pass' >/dev/null 2>&1 || return 0
+  "$PYTHON" - "$WORK_SH/verdicts.json" "$1" <<'PY'
+import json, sys
+levels = ["info", "low", "medium", "high", "critical"]
+try:
+    verdicts = json.load(open(sys.argv[1]))
+except ValueError:
+    verdicts = []
+if not verdicts:
+    print("peak verdict (%s): none carried evidence" % sys.argv[2])
+else:
+    v = max(verdicts, key=lambda x: x["Score"])
+    names = "; ".join(s["Name"] for s in (v.get("Signals") or [])) or "-"
+    print("peak verdict (%s): score=%.1f level=%s proc=%s signals=%s"
+          % (sys.argv[2], v["Score"], levels[v["Level"]], v["ProcName"], names))
+PY
+}
+
 rm -rf "$WORK_SH"
 mkdir -p "$DATA_SH"
 
@@ -148,6 +172,9 @@ pass "baseline captured"
 
 "$BINARY" --config "$CONFIG_HOST" --duration 40s > "$WORK_SH/grima.log" 2>&1 &
 GRIMA_PID=$!
+# A failing assertion exits without waiting for the detector, which would leave
+# it holding the port for the next run.
+trap 'kill "$GRIMA_PID" 2>/dev/null' EXIT
 sleep 4
 
 # Calibration is asserted from the log rather than only over HTTP, so this works
@@ -176,9 +203,15 @@ for round in 1 2 3; do
 done
 sleep 4
 
-if grep -qE 'level=(high|critical)' "$WORK_SH/grima.log"; then
+report_peak "benign rewrite"
+
+# response.alert_min_level is medium, so any alert line at all is a false
+# positive. Asserting only "not high|critical" accepts the whole medium band —
+# the first band a benign workload can alert in, and the band §19 recorded a
+# benign atomic-save batch alerting in.
+if grep -q 'ransomware risk detected' "$WORK_SH/grima.log"; then
   cat "$WORK_SH/grima.log"
-  fail "benign rewrite produced a high verdict"
+  fail "benign rewrite alerted"
 fi
 pass "benign rewrite did not alert"
 
@@ -199,12 +232,18 @@ fi
 
 sleep 6
 
-if ! grep -qE 'level=(high|critical)' "$WORK_SH/grima.log"; then
+report_peak "burst encryption"
+
+# The burst encryptor reaches critical on both platforms, so demanding critical
+# rather than high|critical closes the 30-point slack a high threshold leaves:
+# with noisy-OR fusion a run that has gone partly blind still lands in the high
+# band, which is exactly what the old threshold let through (docs/sprints.md §15).
+if ! grep -q 'level=critical' "$WORK_SH/grima.log"; then
   echo "--- grima log ---"; cat "$WORK_SH/grima.log"
   echo "--- encryptor log ---"; cat "$WORK_SH/encryptor.log"
-  fail "encryption workload was not detected"
+  fail "encryption workload was not detected at critical"
 fi
-pass "encryption workload detected"
+pass "encryption workload detected at critical"
 
 # --- in-place encryption: the content signals must fire ----------------------
 
@@ -221,10 +260,11 @@ grep -q 'magic_mismatch' "$WORK_SH/grima.log" && pass "magic-byte mismatch fired
   || fail "in-place encryption produced no magic-byte mismatch"
 
 wait "$GRIMA_PID" 2>/dev/null
+trap - EXIT
 
 echo
 echo "--- detected verdicts ---"
-grep -E 'level=(high|critical)' "$WORK_SH/grima.log" | sed -n '1,3p'
+grep -E 'level=critical' "$WORK_SH/grima.log" | sed -n '1,3p'
 
 echo
 echo "smoke test complete"

@@ -175,7 +175,25 @@ fi
 "$BINARY" --config "$(to_host_path "$WORK/grima.toml")" --duration "$DURATION" > "$WORK/grima.log" 2>&1 &
 DET_PID=$!
 trap 'kill "$DET_PID" 2>/dev/null' EXIT
-sleep 5
+
+# The detector is ready once the dashboard is listening, which happens after
+# every sensor has started. Poll for that instead of guessing a sleep: a
+# detector that never gets there — filewatch has been seen to stall on a large
+# monitor tree — would otherwise be measured as a workload that stayed silent.
+ready_deadline=$(( $(date +%s) + 30 ))
+while [ "$(date +%s)" -lt "$ready_deadline" ]; do
+  grep -q 'dashboard listening' "$WORK/grima.log" && break
+  kill -0 "$DET_PID" 2>/dev/null || break
+  sleep 1
+done
+if ! grep -q 'dashboard listening' "$WORK/grima.log"; then
+  echo "error: the detector did not finish starting within 30s:" >&2
+  cat "$WORK/grima.log" >&2
+  kill "$DET_PID" 2>/dev/null
+  wait "$DET_PID" 2>/dev/null
+  trap - EXIT
+  exit 2
+fi
 
 if grep -q 'no usable baseline' "$WORK/grima.log"; then
   echo "error: detector ran uncalibrated despite a captured baseline" >&2
@@ -247,10 +265,21 @@ for v in json.load(open(sys.argv[1])):
           % (v["Score"], levels[v["Level"]], v["PID"], v["ProcName"], signals or "-"))
 PY
 else
-  echo "(no verdict published)"
+  echo "(no verdict carried evidence)"
 fi
 
 alerts="$(grep -c 'ransomware risk detected' "$WORK/grima.log")"
+
+# Time from the start of the measured workload to the first alert. A false
+# positive that takes twenty seconds to appear is a different problem from one
+# that fires on the first write, and a spread over rounds needs both numbers.
+ttd="-"
+first_alert="$(grep -m1 'ransomware risk detected' "$WORK/grima.log" || true)"
+if [ -n "$first_alert" ]; then
+  alert_at="$(printf '%s' "$first_alert" | sed -n 's/^time=\([^ ]*\).*/\1/p')"
+  alert_epoch="$(date -d "$alert_at" +%s 2>/dev/null || true)"
+  [ -n "$alert_epoch" ] && ttd=$(( alert_epoch - start ))
+fi
 echo
 echo "--- detector alerts during the measured pass ---"
 if [ "$alerts" = "0" ]; then
@@ -262,11 +291,11 @@ echo "logs: $WORK"
 
 # One machine-readable line, so a spread report or any other consumer reads a
 # parsed result instead of re-parsing the human-readable verdict dump above.
-"$PYTHON" - "$WORK/verdicts.json" "$NAME" "$alerts" <<'PY' || \
-  echo "RESULT scenario=$NAME max_score=unavailable max_level=unavailable max_signals=- alerts=$alerts"
+"$PYTHON" - "$WORK/verdicts.json" "$NAME" "$alerts" "$ttd" <<'PY' || \
+  echo "RESULT scenario=$NAME max_score=unavailable max_level=unavailable max_signals=- alerts=$alerts ttd=$ttd"
 import json, os, sys
 
-path, name, alerts = sys.argv[1], sys.argv[2], sys.argv[3]
+path, name, alerts, ttd = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 levels = ["info", "low", "medium", "high", "critical"]
 verdicts = []
 if os.path.exists(path) and os.path.getsize(path):
@@ -275,12 +304,12 @@ if os.path.exists(path) and os.path.getsize(path):
     except ValueError:
         verdicts = []
 if not verdicts:
-    print("RESULT scenario=%s max_score=none max_level=none max_signals=- alerts=%s" % (name, alerts))
+    print("RESULT scenario=%s max_score=none max_level=none max_signals=- alerts=%s ttd=%s" % (name, alerts, ttd))
 else:
     peak = max(verdicts, key=lambda v: v["Score"])
     names = ",".join(s["Name"] for s in (peak.get("Signals") or [])) or "-"
-    print("RESULT scenario=%s max_score=%.1f max_level=%s max_signals=%s alerts=%s"
-          % (name, peak["Score"], levels[peak["Level"]], names, alerts))
+    print("RESULT scenario=%s max_score=%.1f max_level=%s max_signals=%s alerts=%s ttd=%s"
+          % (name, peak["Score"], levels[peak["Level"]], names, alerts, ttd))
 PY
 
 echo

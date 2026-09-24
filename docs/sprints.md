@@ -27,6 +27,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 18. [Two Weight-Table Problems The Ablation Must Price](#18-two-weight-table-problems-the-ablation-must-price)
 19. [The Atomic-Save False Positive](#19-the-atomic-save-false-positive)
 20. [Host Mode: Where Evidence Is Filed](#20-host-mode-where-evidence-is-filed)
+21. [The npm False Positive, and One Unreproduced Claim](#21-the-npm-false-positive-and-one-unreproduced-claim)
 
 ---
 
@@ -189,6 +190,30 @@ fixed-window detector.
 **Carried in from Sprint 1.** Items 2.9–2.11 were not in the original plan; they come from
 what Sprint 1 measured. 2.9 and 2.10 exist because the measurements were taken and the
 results were surprising, not because the sprint finished short.
+
+### Sprint 2 outcome
+
+| # | Item | Result |
+|---|---|---|
+| 2.1 | n-gram gap | ✅ **Done.** Implemented rather than deleted: `ngram_rename_chain` is signal #14 and appears in live verdicts. Its limits are measured in §17. |
+| 2.2 | Drip validation | ⚠️ **Half met.** Drip is now **detected** at critical where it previously produced no alert, but the criterion's second clause fails: the window did not stay flat, so the cumulative track is not what carries it. Restated in §20. |
+| 2.3 | Intermittent validation | ⚠️ **Unverified.** A head/tail fixture exists; no result demonstrates the tail sample was the carrier. |
+| 2.4 | Calibration round-trip | ✅ **Done.** Verified both directions through a real detector, including the stale-baseline path. |
+| 2.5 | Recalibration feedback | ✅ **Done.** Implemented, `--recalibrate` wired, before/after proven through the real scorer. |
+| 2.6 | Tree aggregation under a real split | ✅ **Done, under per-process attribution** — the only configuration where it can be met. Split workload measured: tree 63.2 medium while each child stays silent. See §20. |
+| 2.7 | Fingerprint memory bound | ✅ **Done.** Ring wrap and 500×20 start/exit cycles pinned. |
+| 2.8 | Benign corpus | ✅ **Met**, with a deviation: npm measured at 50 packages rather than 200, because the scripted default could not be measured at all. Four of five workloads silent; **npm is a genuine false positive** (§21). |
+| 2.9 | `max_delay` tuning | ❌ **Not done.** Needs an elevated run. |
+| 2.10 | Report spread, not one figure | ✅ **Done.** `benign-fp-spread.sh` reports N-round spread. |
+| 2.11 | Re-baseline smoke thresholds | ✅ **Done.** Assertions tightened in both smoke scripts. |
+
+**Nine met, one half, one unverified, one outstanding.** 2.9 is the only item blocked on
+something outside the repo — one elevated run.
+
+**Two things this table records that the sprint would otherwise have hidden.** 2.2's criterion
+was met in outcome and not in mechanism, and the honest reading is in §20 rather than a tick.
+2.8 met its criterion while finding a false positive, which is the corpus doing its job — a
+benign-corpus item that reports no false positives has probably not been run.
 
 ---
 
@@ -1333,3 +1358,60 @@ closed, which is exactly the kind of claim this project's own §11 exists to pre
 Item 2.6's exit criterion is therefore met **under per-process attribution**, which is the
 only configuration in which it can be met, and the sprint plan should say so rather than
 implying it holds by default.
+
+---
+
+## 21. The npm False Positive, and One Unreproduced Claim
+
+### npm alerts at critical on a benign install
+
+The benign corpus found a second false positive, and it is reproducible: **3 of 3 spread
+rounds at 100.0 critical**, 12–13 alert lines each.
+
+```
+signals="delete_rate=1.000; unknown_extension_activity=1.000; entropy_deviation=0.051"
+```
+
+**The root cause is a harness artifact, and it is worth being precise about which part is
+which.** The harness calibrates for 15 s, but one npm pass takes 22 s. npm's temp-file rename
+loop runs at the *end* of the pass — outside the window — so that run's baseline recorded
+`known_ext = [.js, .json, .md]` with no `.tmp` and no `.log`. The measured pass then writes
+~60 files with those extensions, and `unknown_extension_activity` counts them as novel and
+saturates at 100 on its own.
+
+Compare atomic-save, whose `known_ext` *does* include `.tmp` and `.log` because its writes and
+renames interleave from t=0 and fall inside the window. Same signal, opposite outcome, and the
+difference is whether calibration saw the workload.
+
+**So this is two findings at once:**
+
+1. **A harness defect:** a calibration window shorter than one workload pass leaves the
+   workload's own extensions unlearned. Fixed by calibrating until a full pass has completed
+   rather than for a fixed duration.
+2. **A real behaviour, already recorded:** a first-seen extension alerts at 100 on its own
+   (§18). This is that behaviour showing up in a benign context, which is precisely the
+   false-positive class item 4.10 exists to price.
+
+Reporting it as "npm is a false positive, cause unknown" would have been wrong, and so would
+treating it as purely a harness bug. It is both, and the split matters.
+
+### Atomic-save is now silent
+
+The same run measured the workload from §19 at **peak 20 (info), zero alerts** — down from
+56.6 medium, then 45.1 medium. Host mode plus the weight fixes removed it. The open defect in
+§19 is closed by the §20 change, not by tuning the band.
+
+### A claim I could not reproduce
+
+The agent reported that `filewatch.Start` "never returns" on a 403-directory tree. I tested
+**401 directories** and **1041 directories**:
+
+```
+watching directories source=filewatch count=401     (34 ms to start)
+watching directories source=filewatch count=1041    (clean run, exit 0)
+```
+
+Both start in well under a second. **Not reproduced.** It may have been specific to that
+tree's shape — `node_modules` contains symlinks and deep nesting — or a misreading of a slow
+run. Recorded as unreproduced rather than dismissed, because a sensor that can hang is a
+fail-safe violation and worth a targeted test if anyone sees it again.
