@@ -38,7 +38,7 @@ func TestTraceWritesOneLinePerDecision(t *testing.T) {
 	a, path := traced(t, 10)
 
 	a.Observe(7, "crypt", 1, "/usr/bin/crypt", 4096)
-	if pid, _, _, _, _ := a.Suspect(time.Now()); pid != 7 {
+	if pid, _, _, _, _ := a.Suspect(time.Now(), "/tmp/watched.txt"); pid != 7 {
 		t.Fatalf("pid = %d, want 7 with tracing on", pid)
 	}
 
@@ -62,7 +62,7 @@ func TestTraceIsEnabledByEnvironment(t *testing.T) {
 	t.Cleanup(func() { _ = a.trace.close() })
 
 	a.Observe(11, "writer", 0, "", 2048)
-	a.Suspect(time.Now())
+	a.Suspect(time.Now(), "/tmp/watched.txt")
 
 	if lines := traceLines(t, path); len(lines) != 1 {
 		t.Fatalf("trace lines = %d, want 1 when %s is set", len(lines), tracePathEnv)
@@ -76,7 +76,7 @@ func TestTraceIsOffByDefault(t *testing.T) {
 
 	a := New(2 * time.Second)
 	a.Observe(12, "writer", 0, "", 2048)
-	if pid, _, _, _, _ := a.Suspect(time.Now()); pid != 12 {
+	if pid, _, _, _, _ := a.Suspect(time.Now(), "/tmp/watched.txt"); pid != 12 {
 		t.Fatalf("pid = %d, want 12 with tracing off", pid)
 	}
 
@@ -96,7 +96,7 @@ func TestTraceIsOffByDefault(t *testing.T) {
 func TestTraceRecordsUnattributedDecisions(t *testing.T) {
 	a, path := traced(t, 10)
 
-	a.Suspect(time.Now())
+	a.Suspect(time.Now(), "/tmp/watched.txt")
 
 	lines := traceLines(t, path)
 	if len(lines) != 1 || !strings.Contains(lines[0], `"pid":0`) {
@@ -112,7 +112,7 @@ func TestTraceOpenFailureStillAttributes(t *testing.T) {
 	a.trace = newTracer(path, 10)
 
 	a.Observe(7, "crypt", 0, "", 4096)
-	if pid, _, _, _, _ := a.Suspect(time.Now()); pid != 7 {
+	if pid, _, _, _, _ := a.Suspect(time.Now(), "/tmp/watched.txt"); pid != 7 {
 		t.Fatalf("pid = %d, want 7 when the trace file cannot be opened", pid)
 	}
 	if got := a.trace.droppedLines(); got != 1 {
@@ -126,7 +126,7 @@ func TestTraceStopsAtLineLimit(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		a.Observe(7, "crypt", 0, "", 4096)
-		a.Suspect(time.Now())
+		a.Suspect(time.Now(), "/tmp/watched.txt")
 	}
 
 	if lines := traceLines(t, path); len(lines) != 2 {

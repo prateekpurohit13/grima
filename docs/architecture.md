@@ -544,7 +544,7 @@ alert throttling is a Phase 5 option.
 | Process lifecycle, tree, I/O counters | ProcessWatch | `internal/sensor/procwatch` |
 | Persistence mechanism detection | PersistenceWatch | `internal/sensor/persistwatch` |
 | Canary planting + registry | Decoy planter | `internal/decoy` |
-| File-event → process correlation | Attributor | `internal/attrib` |
+| File-event → process attribution | Attributor (correlation, or causal from Windows file-system auditing) | `internal/attrib` |
 | Rolling window, cumulative counters | Fingerprint engine | `internal/fingerprint` |
 | Process-tree summation | Tree aggregator | `internal/fingerprint` |
 | Host baseline capture/persist/reload | Calibration store | `internal/calibrate` |

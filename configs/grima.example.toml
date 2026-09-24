@@ -34,6 +34,28 @@ sample_interval = "2s"
 # more CPU.
 sample_interval = "1s"
 
+[attribution]
+# How a file event is attributed to a process.
+#
+#   correlate  blame the largest recent writer. No privileges needed, and wrong
+#              whenever another process wrote more bytes in the same window.
+#   audit      take the writer from Windows file-system auditing: an audit ACE on
+#              each monitored directory makes the Security log report every write
+#              with the process that made it. Needs an elevated process.
+#
+# A mode that cannot start falls back to correlate with the reason in the log,
+# so the detector keeps running and says why it cannot name the actor.
+mode = "correlate"
+
+# How long a file event waits for the audited record before it is attributed by
+# correlation instead. It must exceed the Security log's delivery latency.
+max_delay = "300ms"
+
+# Let GRIMA enable the File System audit subcategory and set the audit ACE on
+# every monitored directory. Set false to leave host auditing alone and manage
+# the policy and the ACEs yourself. Either way the process must be elevated.
+audit_setup = true
+
 [decoy]
 # Canary files. A legitimate process has no reason to touch a file the user
 # never created, which makes this the highest-precision signal available.

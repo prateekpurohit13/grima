@@ -53,6 +53,28 @@ type ProcWatchConfig struct {
 	SampleInterval Duration `toml:"sample_interval"`
 }
 
+// AttributionConfig holds settings for matching a file event to the process
+// that caused it.
+type AttributionConfig struct {
+	Mode string `toml:"mode"`
+	// MaxDelay bounds how long a file event waits for a causal record before it
+	// is attributed by correlation instead.
+	MaxDelay Duration `toml:"max_delay"`
+	// AuditSetup lets GRIMA enable the File System audit subcategory and set the
+	// audit ACE on every monitored directory. It needs an elevated process.
+	AuditSetup bool `toml:"audit_setup"`
+}
+
+// Attribution modes.
+const (
+	// AttributionCorrelate blames the largest recent writer. No privileges.
+	AttributionCorrelate = "correlate"
+	// AttributionAudit takes the writer from Windows file-system auditing.
+	AttributionAudit = "audit"
+	// AttributionETW is named by the sprint plan but not implemented yet.
+	AttributionETW = "etw"
+)
+
 // DecoyConfig holds canary-file settings.
 type DecoyConfig struct {
 	Enabled     bool     `toml:"enabled"`
@@ -128,6 +150,7 @@ type Config struct {
 	Bus         BusConfig         `toml:"bus"`
 	FileWatch   FileWatchConfig   `toml:"filewatch"`
 	ProcWatch   ProcWatchConfig   `toml:"procwatch"`
+	Attribution AttributionConfig `toml:"attribution"`
 	Decoy       DecoyConfig       `toml:"decoy"`
 	Window      WindowConfig      `toml:"window"`
 	Calibration CalibrationConfig `toml:"calibration"`
@@ -179,6 +202,11 @@ func Default() Config {
 		},
 		ProcWatch: ProcWatchConfig{
 			SampleInterval: Duration(500 * time.Millisecond),
+		},
+		Attribution: AttributionConfig{
+			Mode:       AttributionCorrelate,
+			MaxDelay:   Duration(300 * time.Millisecond),
+			AuditSetup: true,
 		},
 		Decoy: DecoyConfig{
 			Enabled:     true,
@@ -276,6 +304,9 @@ func (c Config) Validate() error {
 	if c.Scoring.AbsoluteWriteRate <= 0 {
 		return fmt.Errorf("scoring.absolute_write_rate must be positive, got %v", c.Scoring.AbsoluteWriteRate)
 	}
+	if err := c.validateAttribution(); err != nil {
+		return err
+	}
 	if !validLevel(c.Response.AlertMinLevel) {
 		return fmt.Errorf("response.alert_min_level %q is not one of %v", c.Response.AlertMinLevel, LevelNames)
 	}
@@ -297,6 +328,26 @@ func (c Config) Validate() error {
 		if !filepath.IsAbs(p) {
 			return fmt.Errorf("general.monitor_paths entry %q must be an absolute path", p)
 		}
+	}
+	return nil
+}
+
+// validateAttribution rejects an attribution mode GRIMA cannot run, so a typo
+// fails at startup instead of silently correlating.
+func (c Config) validateAttribution() error {
+	mode := c.Attribution.Mode
+	if mode == "" {
+		mode = AttributionCorrelate
+	}
+	switch mode {
+	case AttributionCorrelate, AttributionAudit:
+	case AttributionETW:
+		return fmt.Errorf("attribution.mode %q is not implemented: kernel file events carry a thread id and no path, so ETW needs both a thread-to-process map and a file-object-to-name map; use %q", mode, AttributionAudit)
+	default:
+		return fmt.Errorf("attribution.mode %q is not one of %s, %s", mode, AttributionCorrelate, AttributionAudit)
+	}
+	if c.Attribution.MaxDelay.Std() <= 0 {
+		return fmt.Errorf("attribution.max_delay must be positive, got %s", c.Attribution.MaxDelay.Std())
 	}
 	return nil
 }

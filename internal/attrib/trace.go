@@ -8,11 +8,18 @@ import (
 	"time"
 )
 
+// Sources of a blame decision.
+const (
+	sourceCausal    = "causal"
+	sourceCorrelate = "correlate"
+)
+
 // decision is one blame decision, as JSON on one line of a trace file.
 type decision struct {
 	Time       string  `json:"time"`
 	PID        int32   `json:"pid"`
 	Name       string  `json:"name"`
+	Source     string  `json:"source"`
 	Candidates int     `json:"candidates"`
 	TopBytes   uint64  `json:"top_bytes"`
 	TotalBytes uint64  `json:"total_bytes"`
@@ -115,11 +122,12 @@ func (t *tracer) close() error {
 }
 
 // newDecision describes one Suspect call for the trace.
-func newDecision(now time.Time, pid int32, name string, candidates int, top, total uint64, confidence float64) decision {
+func newDecision(now time.Time, pid int32, name string, candidates int, top, total uint64, confidence float64, source string) decision {
 	return decision{
 		Time:       now.UTC().Format(time.RFC3339Nano),
 		PID:        pid,
 		Name:       name,
+		Source:     source,
 		Candidates: candidates,
 		TopBytes:   top,
 		TotalBytes: total,

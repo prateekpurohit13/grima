@@ -457,14 +457,26 @@ Non-negotiable for this repository. Code review rejects violations.
 
 ## 16. Measure attribution accuracy
 
-User-space file notifications report *that* a file changed, not *who* changed it. GRIMA
-correlates file events against per-process write-volume counters, and that heuristic has a
-measured, severe failure mode. This is how to reproduce the measurement.
+User-space file notifications report *that* a file changed, not *who* changed it. GRIMA has
+two ways to answer "who": correlation against per-process write-volume counters, which needs
+no privileges and has a measured, severe failure mode, and causal attribution from the
+operating system, which needs an elevated process. `attribution.mode` selects one:
+
+| Mode | What it does | Needs |
+|---|---|---|
+| `correlate` (default) | blames the largest recent writer | nothing |
+| `audit` | reads the writer from Windows file-system auditing (Security event 4663) | elevation, and it sets an audit ACE on each monitored directory |
+| `etw` | rejected at startup with the reason — not implemented, see `docs/sprints.md` §14 | — |
+
+A mode that cannot start logs `causal attribution unavailable, correlating instead` with the
+reason and keeps detecting. **If that line is in the log, you are measuring correlation, not
+the causal mechanism.**
 
 ### The trace
 
 Set `GRIMA_ATTRIB_TRACE` to a file path and the detector writes one JSON line per blame
-decision — PID, process name, candidate count, byte totals, and confidence:
+decision — PID, process name, candidate count, byte totals, confidence, and which mechanism
+answered (`source`, `causal` or `correlate`):
 
 ```sh
 GRIMA_ATTRIB_TRACE=/tmp/attrib.jsonl ./grima --config grima.toml --duration 30s
@@ -505,16 +517,35 @@ entirely wrong. `confidence` is the top writer's share of recent write volume, s
 measures *byte dominance*, not attribution correctness. Treat it as a measure of how
 concentrated the byte volume was, never as a probability that the blamed process is right.
 
+### Measuring the causal mechanism (elevated)
+
+`mode = "audit"` needs elevation, so the measurement is one command in an elevated PowerShell
+at the repository root:
+
+```powershell
+.\testdata\scenarios\verify_attribution.ps1
+```
+
+It builds the detector, runs the known-writer scenario for five rounds, scores each trace, and
+prints the aggregate and the pass/fail against the 90% gate. Traces, logs and configs land in
+`%TEMP%\grima-attrib-verify`. Expect `accuracy >= 90%` with `source":"causal"` on nearly every
+decision. If it says the mechanism never started, read the reason it prints — it is the line
+the detector logged, and the mechanism cannot be measured until it is gone.
+
+Use `-AllowUnelevated` to rehearse the harness itself; it will report 0% and say why.
+
 ### Consequences
 
 - **Do not** report per-process attribution as a working feature. The measured bound is 0%
-  for small-file workloads.
+  for small-file workloads, and the causal mechanism's number has not been taken yet
+  (`docs/sprints.md` §14).
 - **Detection still works.** Evidence like entropy deviation and magic-byte mismatch is a
   property of the *file*, so it lands in whichever fingerprint received the events. Verdicts
   reach critical on the correct evidence, attributed to the wrong PID.
-- **The fix is causal attribution**, not a better heuristic: ETW
-  (`Microsoft-Windows-Kernel-File`) on Windows or auditd on Linux report the writing PID
-  directly. That is Phase 1 work, tracked in `docs/sprints.md`.
+- **The fix is causal attribution**, not a better heuristic: an OS event that names the
+  writer. Windows file-system auditing does, and is implemented behind
+  `attribution.mode = "audit"`; ETW's write event carries no path, which is why it was not
+  the one built (`docs/sprints.md` §14).
 - **Tree aggregation partially compensates.** The true writer often appears inside the
   blamed process's tree, so tree-level scoring reaches it even when per-process scoring
   does not. Prefer tree-level claims in the paper.

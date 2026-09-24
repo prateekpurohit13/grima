@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestDefaultsAreValid(t *testing.T) {
@@ -143,5 +144,78 @@ func TestWeightFor(t *testing.T) {
 	}
 	if got := cfg.WeightFor("no_such_signal"); got != 0 {
 		t.Fatalf("weight = %v, want 0 for an unknown signal", got)
+	}
+}
+
+func TestAttributionDefaultsAreCorrelation(t *testing.T) {
+	cfg := Default()
+	if cfg.Attribution.Mode != AttributionCorrelate {
+		t.Fatalf("mode = %q, want %q so nothing regresses unelevated", cfg.Attribution.Mode, AttributionCorrelate)
+	}
+	if cfg.Attribution.MaxDelay.Std() <= 0 {
+		t.Fatalf("max_delay = %s, want a positive wait", cfg.Attribution.MaxDelay.Std())
+	}
+}
+
+func TestAttributionModes(t *testing.T) {
+	cases := []struct {
+		name    string
+		mode    string
+		wantErr bool
+	}{
+		{"default", AttributionCorrelate, false},
+		{"audit", AttributionAudit, false},
+		{"empty means correlate", "", false},
+		{"etw is named but not implemented", AttributionETW, true},
+		{"typo", "correlte", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Attribution.Mode = tc.mode
+			err := cfg.Validate()
+			if tc.wantErr && err == nil {
+				t.Fatalf("mode %q was accepted", tc.mode)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("mode %q was rejected: %v", tc.mode, err)
+			}
+		})
+	}
+}
+
+// Sad path: a delay of zero would hold a file event forever, or not at all.
+func TestAttributionMaxDelayMustBePositive(t *testing.T) {
+	cfg := Default()
+	cfg.Attribution.MaxDelay = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("want an error for a non-positive max_delay")
+	}
+}
+
+func TestLoadAttributionSection(t *testing.T) {
+	path := writeConfig(t, `
+[general]
+monitor_paths = ["C:\\data"]
+
+[attribution]
+mode = "audit"
+max_delay = "150ms"
+audit_setup = false
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Attribution.Mode != AttributionAudit {
+		t.Fatalf("mode = %q", cfg.Attribution.Mode)
+	}
+	if cfg.Attribution.MaxDelay.Std() != 150*time.Millisecond {
+		t.Fatalf("max_delay = %s", cfg.Attribution.MaxDelay.Std())
+	}
+	if cfg.Attribution.AuditSetup {
+		t.Fatal("audit_setup = true, want the configured false")
 	}
 }

@@ -33,6 +33,7 @@ func Detect(cfg config.Config, log *slog.Logger) Set {
 	// Two sample ticks: wide enough to catch a write that landed between ticks,
 	// narrow enough not to blame a process that stopped writing a while ago.
 	at := attrib.New(2 * sample)
+	at.Configure(cfg.Attribution, cfg.General.MonitorPaths, log)
 	decoys := decoy.NewRegistry()
 
 	return Set{

@@ -102,14 +102,19 @@ func (s *Source) Close() error {
 
 // Stats reports sensor health.
 func (s *Source) Stats() sensor.Stats {
+	attribution := s.attrib.Stats()
 	return sensor.Stats{
 		Name:    name,
 		Events:  s.events.Load(),
 		Errors:  s.errors.Load(),
 		Dropped: s.dropped.Load(),
 		Extra: map[string]uint64{
-			"overflow": s.overflow.Load(),
-			"rescans":  s.rescans.Load(),
+			"overflow":            s.overflow.Load(),
+			"rescans":             s.rescans.Load(),
+			"attrib_causal_hits":  attribution.CausalHits,
+			"attrib_correlate":    attribution.CausalMisses,
+			"attrib_pending_drop": attribution.PendingDrops,
+			"attrib_source_error": attribution.Source.Errors,
 		},
 	}
 }
@@ -167,18 +172,17 @@ func (s *Source) handle(fsEv fsnotify.Event, out chan<- event.Event) {
 		return
 	}
 
-	ev := event.Event{Kind: kind, Path: path}
+	ev := event.Event{Kind: kind, Path: path, Time: time.Now()}
 	if kind == event.KindFileWrite || kind == event.KindFileCreate {
 		s.readContent(&ev, path)
 	}
-	s.attribute(&ev)
 
 	if id, isDecoy := s.decoys.Lookup(path); isDecoy {
 		ev.Kind = event.KindDecoyTouch
 		ev.DecoyID = id
 	}
 
-	s.emit(out, ev)
+	s.attrib.Resolve(ev, func(ev event.Event) { s.emit(out, ev) })
 }
 
 // rescan re-reads recently modified files after an event overflow, so a storm
@@ -204,10 +208,9 @@ func (s *Source) rescan(out chan<- event.Event) {
 			}
 			seen[path] = struct{}{}
 
-			ev := event.Event{Kind: event.KindFileWrite, Path: path}
+			ev := event.Event{Kind: event.KindFileWrite, Path: path, Time: time.Now()}
 			s.readContent(&ev, path)
-			s.attribute(&ev)
-			s.emit(out, ev)
+			s.attrib.Resolve(ev, func(ev event.Event) { s.emit(out, ev) })
 			return nil
 		})
 	}
@@ -225,18 +228,8 @@ func (s *Source) readContent(ev *event.Event, path string) {
 	ev.MagicMismatch = looksWrong(path, head)
 }
 
-func (s *Source) attribute(ev *event.Event) {
-	pid, procName, ppid, exe, confidence := s.attrib.Suspect(time.Now())
-	ev.PID = pid
-	ev.ProcName = procName
-	ev.PPID = ppid
-	ev.Exe = exe
-	ev.AttribConfidence = confidence
-}
-
 func (s *Source) emit(out chan<- event.Event, ev event.Event) {
 	ev.Source = name
-	ev.Time = time.Now()
 	s.events.Add(1)
 
 	select {
