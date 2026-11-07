@@ -64,3 +64,7 @@ grima-decoys.json
 # new sprint's directory is ignored without anyone remembering to add it.
 /.sprint*/
 /.audit/
+
+# Python bytecode from figures/make_figures.py
+__pycache__/
+*.pyc
